@@ -1,0 +1,264 @@
+services:
+  # Imagem base comum para API e Worker
+  presence-common-base:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.common-base
+    image: presence-common-base:latest
+
+  # Imagem base para a API
+  presence-api-base:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api-base
+    image: presence-api-base:latest
+    depends_on:
+      - presence-common-base
+
+  # Imagem base para o Camera Worker
+  presence-worker-base:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker-base
+    image: presence-worker-base:latest
+    depends_on:
+      - presence-common-base
+
+  # Imagem base para o Frontend
+  presence-frontend-base:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend-base
+    image: presence-frontend-base:latest
+
+  # API Principal (Desenvolvimento com Hot Reload)
+  presence-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: presence-api
+    restart: unless-stopped
+    ports:
+      - "9000:9000"  # Expor porta para Windows
+    networks:
+      - presence-network
+    volumes:
+      - ./:/root/presence
+      - ./data:/root/presence/data
+      - ./logs:/root/presence/logs
+    environment:
+      - PYTHONPATH=/root/presence
+      - INSIGHTFACE_HOME=/root/presence/data/models
+      - DEVELOPMENT=true
+      - ENVIRONMENT=development
+      - DOCKER_ENV=true
+      - RECOGNITION_WORKER_URL=http://presence-recognition-worker:9001
+      - API_BASE_URL=http://presence-api:9000
+      - WEBRTC_SERVER_URL=http://presence-vms-webrtc:8766
+      - HOST_IP=${HOST_IP:-127.0.0.1}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - USE_GPU=true
+      - CUDA_VISIBLE_DEVICES=0
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, utility]
+    depends_on:
+      - presence-api-base
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Recognition Worker (GPU/CUDA isolado)
+  presence-recognition-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.recognition-worker
+    container_name: presence-recognition-worker
+    restart: unless-stopped
+    ports:
+      - "9001:9001"  # Expor porta para comunicação
+    networks:
+      - presence-network
+    volumes:
+      - ./:/root/presence
+      - ./data:/root/presence/data
+      - ./logs:/root/presence/logs
+    environment:
+      - PYTHONPATH=/root/presence
+      - INSIGHTFACE_HOME=/root/presence/data/models
+      - USE_GPU=true
+      - CUDA_VISIBLE_DEVICES=0
+      - DEVELOPMENT=true
+      - ENVIRONMENT=development
+      - DOCKER_ENV=true
+      - WEBRTC_SERVER_URL=http://presence-vms-webrtc:8766
+      - API_BASE_URL=http://presence-api:9000
+      - RECOGNITION_WORKER_URL=http://presence-recognition-worker:9001
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - ONNXRUNTIME_PROVIDERS=CUDAExecutionProvider
+      - FAISS_ENABLE_GPU=1
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    depends_on:
+      presence-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, utility]
+
+  # Camera Worker (Performance Worker com multiprocessing)
+  presence-camera-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: presence-camera-worker
+    restart: unless-stopped
+    networks:
+      - presence-network
+    volumes:
+      - ./:/root/presence
+      - ./data:/root/presence/data
+      - ./logs:/root/presence/logs
+    environment:
+      - PYTHONPATH=/root/presence
+      - API_BASE_URL=http://presence-api:9000
+      - RECOGNITION_WORKER_URL=http://presence-recognition-worker:9001
+      - USE_PERFORMANCE_WORKER=true
+      - USE_GPU=true
+      - CUDA_VISIBLE_DEVICES=0
+      - DEVELOPMENT=true
+      - ENVIRONMENT=development
+      - DOCKER_ENV=true
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - GST_GL_API=opengl
+      - GST_GL_PLATFORM=egl
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    depends_on:
+      presence-api:
+        condition: service_healthy
+      presence-recognition-worker:
+        condition: service_healthy
+      presence-worker-base:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, utility, video]
+
+  
+  # VMS WebRTC Server (Video Management System com GStreamer)
+  presence-vms-webrtc:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.webrtc-cuda
+    container_name: presence-vms-webrtc
+    restart: unless-stopped
+    ports:
+      - "8766:8766"  # Expor porta para Windows
+      - "40000-40100:40000-40100/udp"  # Portas UDP fixas para ICE 
+    networks:
+      presence-network:
+        ipv4_address: 172.21.0.3
+    volumes:
+      - ./:/root/presence
+      - ./data:/root/presence/data
+      - ./logs:/root/presence/logs
+    environment:
+      - PYTHONPATH=/root/presence
+      - INSIGHTFACE_HOME=/root/presence/data/models
+      - USE_GPU=true
+      - CUDA_VISIBLE_DEVICES=0
+      - DEVELOPMENT=true
+      - ENVIRONMENT=development
+      - DOCKER_ENV=true
+      - VMS_WEBRTC_PORT=8766
+      - GST_DEBUG=3
+      - GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0
+      - LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+      # ICE/WebRTC configuration for bridge network
+      - WEBRTC_HOST_NETWORK=false
+      - WEBRTC_HOST_IP=172.21.0.1  # Docker gateway IP (accessible from Windows)
+      - WEBRTC_PUBLIC_IP=172.21.0.1
+      - AIORTC_FORCE_HOST_IP=172.21.0.1
+      - DOCKER_BRIDGE_IP=172.21.0.1  # Docker bridge gateway IP
+      - AIORTC_UDP_PORT_RANGE=40000-40100
+      - WEBRTC_UDP_PORT_RANGE=40000-40100
+      - AIORTC_STRICT_PORT_RANGE=true
+      - WEBRTC_FORCE_UDP_RANGE=true
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, utility, video]
+
+  # Frontend (Desenvolvimento com Hot Reload)
+  presence-frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+      target: development
+    container_name: presence-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"  # Expor porta para Windows
+    networks:
+      - presence-network
+    volumes:
+      - ./frontend:/app
+    environment:
+      - NODE_ENV=development
+      - DOCKER_ENV=true
+      - VITE_API_URL=http://172.21.0.1:9000  # IP do WSL2 para bridge network
+      - VITE_VMS_WEBRTC_URL=http://172.21.0.1:8766 # URL do VMS WebRTC
+    depends_on:
+      presence-api:
+        condition: service_healthy
+      presence-frontend-base:
+        condition: service_completed_successfully
+
+networks:
+  presence-network:
+    driver: bridge
+    name: presence-network
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.21.0.0/16
+          gateway: 172.21.0.1
+
+volumes:
+  presence-data:
+    driver: local
+  presence-logs:
+    driver: local

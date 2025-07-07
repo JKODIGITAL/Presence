@@ -1,0 +1,809 @@
+"""
+WebRTC GStreamer Worker - Extensão do camera_worker com webrtcbin
+Aproveita toda a infraestrutura existente e adiciona WebRTC direto
+"""
+
+import asyncio
+import time
+import threading
+import os
+import sys
+import json
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime
+import logging
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(name)s:%(funcName)s:%(lineno)d - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Verificar se deve usar implementação simples
+USE_SIMPLE_WEBSOCKET = os.environ.get('USE_SIMPLE_WEBSOCKET', 'false').lower() == 'true'
+
+# Tentar importar websockets, se não estiver disponível usar implementação alternativa
+if USE_SIMPLE_WEBSOCKET:
+    print("🔧 Usando implementação WebSocket simples (sem dependências externas)")
+    WEBSOCKETS_AVAILABLE = False
+else:
+    try:
+        import websockets
+        WEBSOCKETS_AVAILABLE = True
+    except ImportError:
+        print("⚠️ websockets não disponível, usando implementação WebSocket alternativa")
+        WEBSOCKETS_AVAILABLE = False
+
+# Importar infraestrutura existente do camera_worker
+try:
+    from app.core.config import settings
+    
+    # Sempre usar ambiente MSYS2 para camera_worker
+    logger.info("🔧 Usando GStreamer nativo (MSYS2) para camera_worker")
+    
+    # Importar PyGObject direto (MSYS2)
+    import gi
+    gi.require_version('Gst', '1.0')
+    gi.require_version('GstApp', '1.0')
+    gi.require_version('GstWebRTC', '1.0')
+    gi.require_version('GstSdp', '1.0')
+    
+    from gi.repository import Gst, GstApp, GLib, GstWebRTC, GstSdp
+    
+    # Inicializar GStreamer
+    Gst.init(None)
+    
+    GSTREAMER_AVAILABLE = True
+    WEBRTC_AVAILABLE = True
+    logger.info("✅ GStreamer WebRTC disponível (MSYS2 nativo)")
+        
+except ImportError as e:
+    logger.error(f"Erro ao importar dependências WebRTC: {e}")
+    logger.error("Certifique-se de que PyGObject está instalado no MSYS2:")
+    logger.error("pacman -S mingw-w64-x86_64-python-gobject")
+    logger.error("pacman -S mingw-w64-x86_64-gstreamer")
+    logger.error("pacman -S mingw-w64-x86_64-gst-plugins-bad")
+    GSTREAMER_AVAILABLE = False
+    WEBRTC_AVAILABLE = False
+
+# Implementação WebSocket alternativa se websockets não estiver disponível
+if not WEBSOCKETS_AVAILABLE:
+    import socket
+    import threading
+    import base64
+    import hashlib
+    import struct
+    
+    class SimpleWebSocketServer:
+        """Implementação WebSocket simples usando socket padrão"""
+        
+        def __init__(self, host='127.0.0.1', port=8765):
+            self.host = host
+            self.port = port
+            self.server_socket = None
+            self.clients = {}
+            self.running = False
+            self.message_handler = None
+        
+        async def start_server(self, handler):
+            """Iniciar servidor WebSocket"""
+            self.message_handler = handler
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            self.running = True
+            
+            logger.info(f"WebSocket server iniciado em {self.host}:{self.port}")
+            
+            while self.running:
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    threading.Thread(
+                        target=self._handle_client, 
+                        args=(client_socket, address)
+                    ).start()
+                except Exception as e:
+                    if self.running:
+                        logger.error(f"Erro no servidor WebSocket: {e}")
+        
+        def _handle_client(self, client_socket, address):
+            """Gerenciar cliente WebSocket"""
+            try:
+                # Handshake WebSocket
+                if self._websocket_handshake(client_socket):
+                    client_id = f"{address[0]}:{address[1]}"
+                    self.clients[client_id] = client_socket
+                    logger.info(f"Cliente WebSocket conectado: {client_id}")
+                    
+                    # Loop de mensagens
+                    while self.running:
+                        try:
+                            message = self._receive_message(client_socket)
+                            if message:
+                                # Simular chamada async para compatibilidade
+                                if self.message_handler:
+                                    asyncio.create_task(
+                                        self.message_handler(client_socket, f"/{client_id}")
+                                    )
+                            else:
+                                break
+                        except Exception:
+                            break
+                    
+                    if client_id in self.clients:
+                        del self.clients[client_id]
+                    logger.info(f"Cliente WebSocket desconectado: {client_id}")
+                
+            except Exception as e:
+                logger.error(f"Erro no cliente WebSocket: {e}")
+            finally:
+                client_socket.close()
+        
+        def _websocket_handshake(self, client_socket):
+            """Fazer handshake WebSocket"""
+            try:
+                request = client_socket.recv(1024).decode('utf-8')
+                lines = request.split('\r\n')
+                
+                # Encontrar Sec-WebSocket-Key
+                websocket_key = None
+                for line in lines:
+                    if line.startswith('Sec-WebSocket-Key:'):
+                        websocket_key = line.split(': ')[1]
+                        break
+                
+                if not websocket_key:
+                    return False
+                
+                # Gerar Sec-WebSocket-Accept
+                magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                accept_key = base64.b64encode(
+                    hashlib.sha1((websocket_key + magic_string).encode()).digest()
+                ).decode()
+                
+                # Enviar resposta
+                response = (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
+                )
+                client_socket.send(response.encode())
+                return True
+                
+            except Exception:
+                return False
+        
+        def _receive_message(self, client_socket):
+            """Receber mensagem WebSocket"""
+            try:
+                # Simplificado - apenas para teste
+                data = client_socket.recv(1024)
+                if len(data) < 2:
+                    return None
+                
+                # Parse frame WebSocket básico
+                payload_length = data[1] & 0x7F
+                if payload_length < 126:
+                    mask_start = 2
+                else:
+                    return None  # Simplificado
+                
+                mask = data[mask_start:mask_start + 4]
+                payload = data[mask_start + 4:mask_start + 4 + payload_length]
+                
+                # Unmask
+                decoded = bytearray()
+                for i in range(len(payload)):
+                    decoded.append(payload[i] ^ mask[i % 4])
+                
+                return decoded.decode('utf-8')
+                
+            except Exception:
+                return None
+        
+        def send_message(self, client_socket, message):
+            """Enviar mensagem WebSocket"""
+            try:
+                payload = message.encode('utf-8')
+                frame = bytearray()
+                frame.append(0x81)  # Text frame
+                
+                if len(payload) < 126:
+                    frame.append(len(payload))
+                else:
+                    return False  # Simplificado
+                
+                frame.extend(payload)
+                client_socket.send(frame)
+                return True
+                
+            except Exception:
+                return False
+        
+        def close(self):
+            """Fechar servidor"""
+            self.running = False
+            if self.server_socket:
+                self.server_socket.close()
+            for client in self.clients.values():
+                client.close()
+            self.clients.clear()
+
+class WebRTCGStreamerCamera:
+    """Câmera WebRTC com GStreamer integrado"""
+    
+    def __init__(self, camera_config: Dict[str, Any]):
+        # Configuração básica da câmera
+        self.camera_id = camera_config.get('id', 'unknown')
+        self.camera_name = camera_config.get('name', f'Camera {self.camera_id}')
+        self.rtsp_url = camera_config.get('rtsp_url', '')
+        self.enabled = camera_config.get('enabled', True)
+        self.fps = camera_config.get('fps', 10)
+        self.output_width = camera_config.get('output_width', 640)
+        self.output_height = camera_config.get('output_height', 480)
+        self.use_hardware_decode = camera_config.get('use_hardware_decode', True)
+        self.use_hardware_encode = camera_config.get('use_hardware_encode', True)
+        
+        # Pipeline GStreamer
+        self.pipeline = None
+        self.main_loop = None
+        self.bus = None
+        self.running = False
+        
+        # WebRTC específico
+        self.webrtc_enabled = camera_config.get('webrtc_enabled', True)
+        self.webrtc_bin = None
+        self.webrtc_sessions = {}
+        self.signaling_server = None
+        self.ice_candidates = []
+        
+        # WebSocket para sinalização
+        self.websocket_server = None
+        self.websocket_port = camera_config.get('websocket_port', 8765)
+        
+        logger.info(f"WebRTC Camera configurada: {self.camera_id}")
+    
+    def _get_source_pipeline(self) -> str:
+        """Obter pipeline de source"""
+        if self.rtsp_url:
+            return f"rtspsrc location={self.rtsp_url} latency=300"
+        else:
+            return f"videotestsrc pattern=0"  # Padrão de teste
+    
+    def _get_decode_pipeline(self) -> str:
+        """Obter pipeline de decode"""
+        if self.use_hardware_decode and self.rtsp_url:
+            return "rtph264depay ! nvh264dec"
+        elif self.rtsp_url:
+            return "rtph264depay ! avdec_h264"
+        else:
+            return "videoconvert"
+    
+    def is_running(self) -> bool:
+        """Verificar se está rodando"""
+        return self.running and self.pipeline is not None
+    
+    def build_pipeline_string(self) -> str:
+        """Construir pipeline GStreamer com webrtcbin"""
+        
+        if not self.webrtc_enabled or not WEBRTC_AVAILABLE:
+            logger.info(f"WebRTC desabilitado para {self.camera_id}")
+            return ""
+        
+        # Modificar pipeline para incluir webrtcbin
+        # Usar tee para dividir o stream: um para processamento local, outro para WebRTC
+        webrtc_pipeline = self._build_webrtc_pipeline()
+        
+        return webrtc_pipeline
+    
+    def _build_webrtc_pipeline(self) -> str:
+        """Construir pipeline específico com WebRTC"""
+        
+        # Source (RTSP/USB/Video file)
+        source_part = self._get_source_pipeline()
+        
+        # Decode part (mantém NVDEC se disponível)
+        decode_part = self._get_decode_pipeline()
+        
+        # Processing tee - divide para processamento local e WebRTC
+        processing_part = f"""
+        {source_part} !
+        {decode_part} !
+        video/x-raw,format=RGBA,width={self.output_width},height={self.output_height},framerate={self.fps}/1 !
+        tee name=t
+        
+        t. ! queue ! videoconvert ! video/x-raw,format=RGB !
+        appsink name=appsink emit-signals=true sync=false max-buffers=1 drop=true
+        
+        t. ! queue ! videoconvert ! 
+        {self._get_webrtc_encode_pipeline()}
+        """
+        
+        return processing_part.replace('\n', ' ').strip()
+    
+    def _get_webrtc_encode_pipeline(self) -> str:
+        """Pipeline de encoding para WebRTC"""
+        
+        if self.use_hardware_encode:
+            # Hardware encoding com NVENC
+            encode = f"""
+            nvvideoconvert !
+            nvh264enc bitrate=2000 preset=low-latency-hq gop-size=30 rc-mode=cbr zerolatency=true !
+            h264parse config-interval=-1 !
+            rtph264pay config-interval=-1 pt=96 !
+            webrtcbin name=webrtcbin stun-server=stun://stun.l.google.com:19302
+            """
+        else:
+            # Software encoding
+            encode = f"""
+            x264enc bitrate=2000 tune=zerolatency speed-preset=ultrafast key-int-max=30 !
+            h264parse config-interval=-1 !
+            rtph264pay config-interval=-1 pt=96 !
+            webrtcbin name=webrtcbin stun-server=stun://stun.l.google.com:19302
+            """
+        
+        return encode.strip()
+    
+    async def initialize_webrtc(self):
+        """Inicializar componentes WebRTC"""
+        if not self.webrtc_enabled or not WEBRTC_AVAILABLE:
+            return True
+        
+        try:
+            # Inicializar WebSocket server para sinalização
+            await self._start_websocket_server()
+            
+            logger.info(f"✅ WebRTC inicializado para câmera {self.camera_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao inicializar WebRTC para {self.camera_id}: {e}")
+            return False
+    
+    async def _start_websocket_server(self):
+        """Iniciar servidor WebSocket para sinalização"""
+        try:
+            # Usar porta específica para esta câmera
+            port = self.websocket_port + int(self.camera_id.split('_')[-1] if '_' in self.camera_id else '0')
+            
+            if WEBSOCKETS_AVAILABLE:
+                # Usar biblioteca websockets
+                async def handle_client(websocket, path):
+                    await self._handle_websocket_client(websocket, path)
+                
+                self.websocket_server = await websockets.serve(
+                    handle_client, 
+                    "127.0.0.1", 
+                    port
+                )
+                logger.info(f"WebSocket server (websockets) iniciado para {self.camera_id} na porta {port}")
+            else:
+                # Usar implementação alternativa
+                self.websocket_server = SimpleWebSocketServer("127.0.0.1", port)
+                
+                async def handle_client(client_socket, path):
+                    await self._handle_simple_websocket_client(client_socket, path)
+                
+                # Iniciar em thread separada para não bloquear
+                def run_server():
+                    asyncio.run(self.websocket_server.start_server(handle_client))
+                
+                server_thread = threading.Thread(target=run_server)
+                server_thread.daemon = True
+                server_thread.start()
+                
+                logger.info(f"WebSocket server (simple) iniciado para {self.camera_id} na porta {port}")
+            
+        except Exception as e:
+            logger.error(f"Erro ao iniciar WebSocket server: {e}")
+            raise
+    
+    async def _handle_websocket_client(self, websocket, path):
+        """Gerenciar cliente WebSocket"""
+        session_id = f"{self.camera_id}_{time.time()}"
+        self.webrtc_sessions[session_id] = {
+            'websocket': websocket,
+            'created_at': datetime.now()
+        }
+        
+        logger.info(f"Cliente WebRTC conectado: {session_id}")
+        
+        try:
+            async for message in websocket:
+                await self._handle_signaling_message(session_id, message)
+        except Exception as e:
+            if WEBSOCKETS_AVAILABLE and hasattr(e, '__class__') and e.__class__.__name__ == 'ConnectionClosed':
+                logger.info(f"Cliente WebRTC desconectado: {session_id}")
+            else:
+                logger.error(f"Erro no WebSocket: {e}")
+        finally:
+            if session_id in self.webrtc_sessions:
+                del self.webrtc_sessions[session_id]
+    
+    async def _handle_simple_websocket_client(self, client_socket, path):
+        """Gerenciar cliente WebSocket (implementação simples)"""
+        session_id = f"{self.camera_id}_{time.time()}"
+        self.webrtc_sessions[session_id] = {
+            'websocket': client_socket,
+            'created_at': datetime.now()
+        }
+        
+        logger.info(f"Cliente WebSocket conectado (simple): {session_id}")
+        # Implementação simplificada - apenas para teste inicial
+    
+    async def _handle_signaling_message(self, session_id: str, message: str):
+        """Processar mensagem de sinalização"""
+        try:
+            data = json.loads(message)
+            msg_type = data.get('type')
+            
+            if msg_type == 'request-offer':
+                await self._create_offer(session_id)
+            elif msg_type == 'answer':
+                await self._handle_answer(session_id, data.get('sdp'))
+            elif msg_type == 'ice-candidate':
+                await self._handle_ice_candidate(session_id, data.get('candidate'))
+            
+        except json.JSONDecodeError:
+            logger.error(f"JSON inválido recebido: {message}")
+        except Exception as e:
+            logger.error(f"Erro ao processar mensagem de sinalização: {e}")
+    
+    async def _create_offer(self, session_id: str):
+        """Criar offer WebRTC"""
+        try:
+            if not self.webrtc_bin:
+                logger.error("webrtcbin não está disponível")
+                return
+            
+            # Configurar callback para offer criado
+            def on_offer_created(promise, webrtcbin, user_data):
+                reply = promise.get_reply()
+                offer = reply.get_value("offer")
+                
+                # Set local description
+                promise2 = Gst.Promise.new()
+                webrtcbin.emit("set-local-description", offer, promise2)
+                
+                # Enviar offer para cliente
+                asyncio.create_task(self._send_offer(session_id, offer.sdp.as_text()))
+            
+            # Criar offer
+            promise = Gst.Promise.new_with_change_callback(on_offer_created, self.webrtc_bin, None)
+            self.webrtc_bin.emit("create-offer", None, promise)
+            
+        except Exception as e:
+            logger.error(f"Erro ao criar offer: {e}")
+    
+    async def _send_offer(self, session_id: str, sdp: str):
+        """Enviar offer para cliente"""
+        if session_id in self.webrtc_sessions:
+            websocket = self.webrtc_sessions[session_id]['websocket']
+            message = {
+                'type': 'offer',
+                'sdp': sdp
+            }
+            await websocket.send(json.dumps(message))
+            logger.info(f"Offer enviado para {session_id}")
+    
+    async def _handle_answer(self, session_id: str, sdp: str):
+        """Processar answer do cliente"""
+        try:
+            if not self.webrtc_bin:
+                return
+            
+            # Parse SDP
+            sdp_msg = GstSdp.SDPMessage()
+            GstSdp.sdp_message_parse_buffer(sdp.encode(), sdp_msg)
+            
+            # Criar answer description
+            answer = GstWebRTC.WebRTCSessionDescription.new(
+                GstWebRTC.WebRTCSDPType.ANSWER, 
+                sdp_msg
+            )
+            
+            # Set remote description
+            promise = Gst.Promise.new()
+            self.webrtc_bin.emit("set-remote-description", answer, promise)
+            
+            logger.info(f"Answer processado para {session_id}")
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar answer: {e}")
+    
+    async def _handle_ice_candidate(self, session_id: str, candidate: Dict):
+        """Processar ICE candidate"""
+        try:
+            if not self.webrtc_bin:
+                return
+            
+            mline_index = candidate.get('sdpMLineIndex', 0)
+            candidate_str = candidate.get('candidate', '')
+            
+            self.webrtc_bin.emit("add-ice-candidate", mline_index, candidate_str)
+            logger.debug(f"ICE candidate adicionado para {session_id}")
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar ICE candidate: {e}")
+    
+    def _setup_webrtc_callbacks(self):
+        """Configurar callbacks do webrtcbin"""
+        if not self.webrtc_bin:
+            return
+        
+        # ICE candidate callback
+        self.webrtc_bin.connect("on-ice-candidate", self._on_ice_candidate)
+        
+        # Negotiation needed callback
+        self.webrtc_bin.connect("on-negotiation-needed", self._on_negotiation_needed)
+    
+    def _on_ice_candidate(self, webrtcbin, mline_index, candidate):
+        """Callback para ICE candidates"""
+        # Enviar ICE candidate para todos os clientes conectados
+        for session_id, session in self.webrtc_sessions.items():
+            asyncio.create_task(self._send_ice_candidate(session_id, mline_index, candidate))
+    
+    async def _send_ice_candidate(self, session_id: str, mline_index: int, candidate: str):
+        """Enviar ICE candidate para cliente"""
+        if session_id in self.webrtc_sessions:
+            websocket = self.webrtc_sessions[session_id]['websocket']
+            message = {
+                'type': 'ice-candidate',
+                'candidate': {
+                    'candidate': candidate,
+                    'sdpMLineIndex': mline_index
+                }
+            }
+            await websocket.send(json.dumps(message))
+    
+    def _on_negotiation_needed(self, webrtcbin):
+        """Callback quando negociação é necessária"""
+        logger.info(f"Negociação WebRTC necessária para {self.camera_id}")
+    
+    async def start_capture(self) -> bool:
+        """Iniciar captura com WebRTC"""
+        try:
+            # Inicializar WebRTC primeiro
+            if self.webrtc_enabled:
+                webrtc_ok = await self.initialize_webrtc()
+                if not webrtc_ok:
+                    logger.warning(f"WebRTC falhou para {self.camera_id}, continuando sem WebRTC")
+                    self.webrtc_enabled = False
+            
+            # Construir pipeline
+            pipeline_str = self.build_pipeline_string()
+            if not pipeline_str:
+                logger.error(f"Falha ao construir pipeline para {self.camera_id}")
+                return False
+            
+            # Criar pipeline
+            self.pipeline = Gst.parse_launch(pipeline_str)
+            if not self.pipeline:
+                logger.error(f"Falha ao criar pipeline para {self.camera_id}")
+                return False
+            
+            # Configurar bus
+            self.bus = self.pipeline.get_bus()
+            self.bus.add_signal_watch()
+            self.bus.connect("message", self._on_bus_message)
+            
+            # Iniciar pipeline
+            ret = self.pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                logger.error(f"Falha ao iniciar pipeline para {self.camera_id}")
+                return False
+            
+            self.running = True
+            
+            if self.webrtc_enabled:
+                # Obter referência do webrtcbin após pipeline inicializado
+                self.webrtc_bin = self.pipeline.get_by_name("webrtcbin")
+                if self.webrtc_bin:
+                    self._setup_webrtc_callbacks()
+                    logger.info(f"✅ WebRTC pipeline configurado para {self.camera_id}")
+                else:
+                    logger.warning(f"webrtcbin não encontrado no pipeline para {self.camera_id}")
+            
+            logger.info(f"✅ Captura iniciada para {self.camera_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro ao iniciar captura para {self.camera_id}: {e}")
+            return False
+    
+    def _on_bus_message(self, bus, message):
+        """Callback para mensagens do bus"""
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            logger.error(f"Erro no pipeline {self.camera_id}: {err}, {debug}")
+            self.running = False
+        elif t == Gst.MessageType.EOS:
+            logger.info(f"End-of-stream para {self.camera_id}")
+            self.running = False
+    
+    async def stop_capture(self):
+        """Parar captura e cleanup WebRTC"""
+        try:
+            self.running = False
+            
+            # Cleanup WebRTC
+            if self.websocket_server:
+                if WEBSOCKETS_AVAILABLE:
+                    self.websocket_server.close()
+                    await self.websocket_server.wait_closed()
+                else:
+                    self.websocket_server.close()
+            
+            self.webrtc_sessions.clear()
+            
+            # Parar pipeline
+            if self.pipeline:
+                self.pipeline.set_state(Gst.State.NULL)
+                self.pipeline = None
+            
+            if self.bus:
+                self.bus = None
+            
+            logger.info(f"✅ WebRTC cleanup concluído para {self.camera_id}")
+            
+        except Exception as e:
+            logger.error(f"Erro no cleanup para {self.camera_id}: {e}")
+
+class WebRTCGStreamerWorker:
+    """Worker principal com suporte a WebRTC"""
+    
+    def __init__(self):
+        self.cameras = {}
+        self.manager = None
+        self.running = False
+        
+    async def initialize(self) -> bool:
+        """Inicializar worker WebRTC"""
+        try:
+            if not GSTREAMER_AVAILABLE:
+                logger.error("GStreamer não disponível")
+                return False
+            
+            if not WEBRTC_AVAILABLE:
+                logger.error("GStreamer WebRTC não disponível")
+                return False
+            
+            # Verificar elementos WebRTC
+            webrtcbin_factory = Gst.ElementFactory.find("webrtcbin")
+            if not webrtcbin_factory:
+                logger.error("Elemento webrtcbin não encontrado")
+                return False
+            
+            logger.info("✅ WebRTC GStreamer Worker inicializado")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro ao inicializar WebRTC Worker: {e}")
+            return False
+    
+    async def load_cameras(self) -> List[Dict]:
+        """Carregar câmeras da API"""
+        try:
+            # Usar urllib para evitar dependência do aiohttp
+            import urllib.request
+            import urllib.parse
+            
+            url = f"{settings.API_BASE_URL}/api/v1/cameras"
+            
+            try:
+                with urllib.request.urlopen(url, timeout=10) as response:
+                    if response.status == 200:
+                        data = json.loads(response.read().decode())
+                        cameras = data.get('cameras', [])
+                        logger.info(f"📷 {len(cameras)} câmeras carregadas da API")
+                        return cameras
+                    else:
+                        logger.error(f"Erro ao carregar câmeras: HTTP {response.status}")
+                        return []
+            except urllib.error.URLError as e:
+                logger.error(f"Erro ao conectar à API: {e}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Erro ao carregar câmeras da API: {e}")
+            return []
+    
+    async def start_camera(self, camera_config: Dict) -> bool:
+        """Iniciar câmera com WebRTC"""
+        camera_id = camera_config['id']
+        
+        try:
+            # Adicionar configuração WebRTC
+            camera_config.update({
+                'webrtc_enabled': True,
+                'websocket_port': 8765,  # Base port, será incrementado por câmera
+                'use_hardware_encode': True,
+                'use_hardware_decode': True
+            })
+            
+            camera = WebRTCGStreamerCamera(camera_config)
+            
+            success = await camera.start_capture()
+            if success:
+                self.cameras[camera_id] = camera
+                logger.info(f"✅ Câmera WebRTC iniciada: {camera_id}")
+                return True
+            else:
+                logger.error(f"❌ Falha ao iniciar câmera WebRTC: {camera_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Erro ao iniciar câmera {camera_id}: {e}")
+            return False
+    
+    async def run(self):
+        """Executar worker principal"""
+        self.running = True
+        
+        try:
+            # Carregar e iniciar câmeras
+            cameras_config = await self.load_cameras()
+            
+            for camera_config in cameras_config:
+                if camera_config.get('enabled', True):
+                    await self.start_camera(camera_config)
+            
+            logger.info(f"🚀 WebRTC Worker executando com {len(self.cameras)} câmeras")
+            
+            # Loop principal
+            while self.running:
+                await asyncio.sleep(1)
+                
+                # Health check das câmeras
+                for camera_id, camera in list(self.cameras.items()):
+                    if not camera.is_running():
+                        logger.warning(f"Câmera {camera_id} parou, tentando reiniciar...")
+                        await camera.start_capture()
+            
+        except Exception as e:
+            logger.error(f"Erro no loop principal: {e}")
+        finally:
+            await self.cleanup()
+    
+    async def cleanup(self):
+        """Cleanup do worker"""
+        self.running = False
+        
+        # Parar todas as câmeras
+        for camera_id, camera in self.cameras.items():
+            try:
+                await camera.stop_capture()
+                logger.info(f"Câmera {camera_id} parada")
+            except Exception as e:
+                logger.error(f"Erro ao parar câmera {camera_id}: {e}")
+        
+        self.cameras.clear()
+        logger.info("WebRTC Worker cleanup concluído")
+
+async def main():
+    """Função principal"""
+    logger.info("🚀 Iniciando WebRTC GStreamer Worker...")
+    
+    worker = WebRTCGStreamerWorker()
+    
+    try:
+        if not await worker.initialize():
+            logger.error("❌ Falha na inicialização")
+            return
+        
+        await worker.run()
+        
+    except KeyboardInterrupt:
+        logger.info("Interrompido pelo usuário")
+    except Exception as e:
+        logger.error(f"Erro fatal: {e}")
+    finally:
+        await worker.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())

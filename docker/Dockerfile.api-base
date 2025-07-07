@@ -1,0 +1,23 @@
+# Dockerfile.api-base - Dependências específicas da API
+FROM presence-common-base:latest
+
+# Copiar apenas o arquivo de requisitos
+COPY requirements.txt .
+
+# --- Instalação de dependências Python ---
+RUN conda run -n presence pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    conda run -n presence pip install --no-cache-dir -r requirements.txt
+
+# --- Pré-download de Modelos ---
+RUN mkdir -p /root/presence/data/models && \
+    echo "📦 Modelos InsightFace serão baixados no primeiro uso" || true
+
+# Criar estrutura de diretórios
+RUN mkdir -p /root/presence/data/{db,models,uploads,embeddings,images,frames,unknown_faces} /root/presence/logs && \
+    mkdir -p /root/presence/data/uploads/{people,unknown}
+
+# Configurar variáveis de ambiente para o container
+ENV PYTHONPATH=/root/presence
+ENV INSIGHTFACE_HOME=/root/presence/data/models
+ENV GST_DEBUG=2
+ENV GST_DEBUG_DUMP_DOT_DIR=/tmp/gstreamer-debug 

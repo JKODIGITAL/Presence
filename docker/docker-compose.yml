@@ -1,0 +1,78 @@
+services:
+  presence-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - ../data:/app/data
+      - ../logs:/app/logs
+    environment:
+      - DATABASE_URL=sqlite:///data/db/presence.db
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - API_HOST=0.0.0.0
+      - API_PORT=9000
+      - CORS_ORIGINS=*
+    networks:
+      - presence-network
+
+  presence-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    depends_on:
+      - presence-api
+    volumes:
+      - ../data:/app/data
+      - ../logs:/app/logs
+    environment:
+      - DATABASE_URL=sqlite:///data/db/presence.db
+      - API_BASE_URL=http://presence-api:9000
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=development
+    networks:
+      - presence-network
+
+  presence-webrtc:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.webrtc
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=sqlite:///data/db/presence.db
+      - API_BASE_URL=http://localhost:9000
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=development
+      - WEBRTC_PORT=8081
+      - WEBRTC_PUBLIC_IP=187.107.90.106
+      - WEBRTC_HOST_NETWORK=true
+      - AIORTC_UDP_PORT_RANGE=10000-10020
+      - AIORTC_FORCE_HOST_IP=187.107.90.106
+      - TURN_SERVER_URL=turn:openrelay.metered.ca:443?transport=tcp
+      - TURN_USERNAME=openrelayproject
+      - TURN_PASSWORD=openrelayproject
+    volumes:
+      - ../data:/app/data
+      - ../logs:/app/logs
+    network_mode: "host"
+
+  presence-frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - API_URL=http://localhost:9000
+      - WEBRTC_URL=http://localhost:8081
+    networks:
+      - presence-network
+
+networks:
+  presence-network:
+    driver: bridge 

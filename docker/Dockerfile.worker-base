@@ -1,0 +1,48 @@
+# Dockerfile.worker-base - Dependências específicas do Camera Worker
+FROM presence-common-base:latest
+
+# Copiar apenas o arquivo de requisitos
+COPY requirements.txt .
+
+# --- Instalação de dependências Python ---
+RUN conda run -n presence pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    conda run -n presence pip install --no-cache-dir -r requirements.txt
+
+# Criar diretórios necessários
+RUN mkdir -p /root/presence/data/{frames,uploads,unknown_faces} /root/presence/logs 
+
+# Configurar variáveis de ambiente para o container
+ENV PYTHONPATH=/root/presence
+ENV GST_DEBUG=3
+ENV GST_DEBUG_DUMP_DOT_DIR=/tmp/gstreamer-debug
+ENV GI_TYPELIB_PATH=/usr/lib/x86_64-linux-gnu/girepository-1.0
+
+# --- Verificação final do GStreamer ---
+RUN conda run -n presence python -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; Gst.init(None); print('✓ GStreamer inicializado com sucesso no worker-base!');" || echo "⚠ GStreamer não pôde ser inicializado no worker-base"
+
+# --- Instalação de dependências adicionais para o worker ---
+RUN conda run -n presence pip install --no-cache-dir \
+    psutil \
+    requests \
+    numpy \
+    opencv-python-headless \
+    Pillow \
+    pydantic \
+    python-dotenv \
+    PyYAML \
+    scikit-learn \
+    scipy \
+    SQLAlchemy \
+    uvicorn \
+    websockets \
+    aiohttp \
+    redis \
+    # Dependências para o GStreamer
+    PyGObject \
+    pycairo
+
+# --- Verificação simples de instalação ---
+RUN echo "✅ Dependências do worker instaladas com sucesso"
+
+# --- Configuração do diretório de trabalho ---
+WORKDIR /root/presence

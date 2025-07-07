@@ -1,0 +1,21 @@
+# Dockerfile para a API do Presence - Usando imagem base com Hot Reload
+FROM presence-api-base:latest
+
+# Não copiamos o código aqui, pois será montado como volume para Hot Reload
+
+# Expõe a porta da API
+EXPOSE 9000
+
+# Health check para verificar a saúde da aplicação
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:9000/health || exit 1
+
+# Instalar watchdog para monitorar alterações nos arquivos
+RUN conda run -n presence pip install --no-cache-dir watchdog
+
+# Script para iniciar a API com Hot Reload
+COPY docker/scripts/start_api_dev.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/start_api_dev.sh
+
+# Comando para iniciar a API com Hot Reload
+CMD ["/usr/local/bin/start_api_dev.sh"]

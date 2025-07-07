@@ -1,0 +1,24 @@
+{
+  "enabled": true,
+  "face_quality": {
+    "min_face_width": 60,
+    "min_face_height": 80,
+    "min_face_area_ratio": 0.03,
+    "min_detection_confidence": 0.55,
+    "max_similarity_threshold": 0.2,
+    "max_face_angle": 10.0,
+    "min_brightness": 60.0,
+    "max_brightness": 180.0,
+    "min_sharpness": 120.0
+  },
+  "temporal": {
+    "min_presence_duration": 6.5,
+    "min_frame_count": 5,
+    "cooldown_period": 30.0,
+    "face_tracking_timeout": 5.0
+  },
+  "unknown_threshold": 0.4,
+  "unknown_images_dir": "data/unknown_faces",
+  "max_unknowns_per_session": 100,
+  "auto_cleanup_days": 30
+}

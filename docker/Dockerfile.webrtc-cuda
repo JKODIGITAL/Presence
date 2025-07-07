@@ -1,0 +1,50 @@
+# Dockerfile para VMS WebRTC Server - Reutilizando worker-base existente
+FROM presence-worker-base:latest
+
+# Instalar dependências WebRTC e VMS específicas usando conda
+RUN conda run -n presence pip install --no-cache-dir \
+    fastapi \
+    uvicorn[standard] \
+    websockets \
+    python-socketio[asyncio] \
+    aiofiles \
+    nest-asyncio
+
+# Verificar se GStreamer webrtcbin está disponível
+RUN gst-inspect-1.0 webrtcbin || echo "⚠ webrtcbin não encontrado, mas continuando..."
+
+# Instalar plugins WebRTC do GStreamer e bindings Python
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gstreamer1.0-nice \
+    gstreamer1.0-plugins-bad \
+    libgstreamer-plugins-bad1.0-dev \
+    libnice-dev \
+    libgstrtspserver-1.0-dev \
+    gir1.2-gst-rtsp-server-1.0 \
+    gir1.2-nice-0.1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Tentar instalar gst-python via sistema (já está no presence-worker-base)
+RUN echo "GStreamer Python bindings já instalados via sistema"
+
+# Copiar código da aplicação (substituindo o que já existe na base)
+COPY . /root/presence/
+
+# Verificar instalação completa
+RUN conda run -n presence python -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; Gst.init(None); print('✓ GStreamer VMS OK')" && \
+    gst-inspect-1.0 --version && \
+    (gst-inspect-1.0 webrtcbin && echo "✓ WebRTC plugin encontrado") || echo "⚠ WebRTC plugin não encontrado"
+
+# Testar GstWebRTC Python bindings
+RUN conda run -n presence python -c "import gi; gi.require_version('Gst', '1.0'); gi.require_version('GstWebRTC', '1.0'); gi.require_version('GstSdp', '1.0'); from gi.repository import Gst, GstWebRTC, GstSdp; Gst.init(None); print('✓ GstWebRTC Python bindings OK')" || echo "⚠ GstWebRTC Python bindings não disponíveis, usando workaround"
+
+# Expor porta do VMS WebRTC
+EXPOSE 8765
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8765/health || exit 1
+
+# Comando padrão usando conda environment
+CMD ["conda", "run", "-n", "presence", "python", "-m", "app.webrtc_worker.main_vms"]

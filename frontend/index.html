@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Projeto Attendance</title>
+  </head>
+
+  <body class="theme-pro">
+    <div id="root"></div>
+    <script>
+      // Aplicar tema salvo imediatamente para evitar flash
+      const savedTheme = localStorage.getItem('presence-theme') || 'theme-pro';
+      document.body.className = '';
+      document.body.classList.add(savedTheme);
+      document.documentElement.className = '';
+      document.documentElement.classList.add(savedTheme);
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

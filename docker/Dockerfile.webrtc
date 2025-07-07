@@ -1,0 +1,37 @@
+# Dockerfile.webrtc - WebRTC Server usando Worker Base otimizada com CUDA
+FROM presence-worker-base:latest
+
+# Mantém as variáveis de ambiente CUDA da base
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+# Instalar dependências específicas do WebRTC que podem não estar no requirements.txt
+RUN conda run -n presence pip install --no-cache-dir \
+    aiortc==1.6.0 \
+    aiohttp-cors==0.7.0 \
+    av==10.0.0
+
+# Copiar código da aplicação
+COPY . /root/presence/
+
+# Criar diretórios específicos do WebRTC
+RUN mkdir -p /root/presence/data/webrtc_sessions \
+             /root/presence/data/webrtc_stats \
+             /root/presence/logs/webrtc
+
+# Configurar permissões
+RUN chmod +x /root/presence/app/webrtc_worker/webrtc_server.py || true
+
+# Configurações específicas do WebRTC
+ENV WEBRTC_LOG_LEVEL=INFO
+ENV WEBRTC_MAX_CONNECTIONS=10
+ENV WEBRTC_FRAME_RATE=15
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Exposer porta WebRTC
+EXPOSE 8080
+
+# Usar conda environment para máxima compatibility
+CMD ["conda", "run", "-n", "presence", "python", "-m", "app.webrtc_worker.webrtc_server"]

@@ -1,0 +1,28 @@
+# Dockerfile.recognition-worker - Recognition Worker com GPU/CUDA
+FROM presence-worker-base:latest
+
+# Instalar dependências adicionais para Recognition Worker
+RUN conda run -n presence pip install --no-cache-dir \
+    python-socketio[asyncio] \
+    uvicorn[standard] \
+    fastapi
+
+# Copiar código da aplicação
+COPY . /root/presence/
+
+# Definir diretório de trabalho
+WORKDIR /root/presence
+
+# Configurar variáveis de ambiente para GPU
+ENV CUDA_VISIBLE_DEVICES=0
+ENV USE_GPU=true
+ENV PYTHONPATH=/root/presence
+
+# Remover restrições temporárias de GPU
+ENV DISABLE_GPU=""
+
+# Criar diretórios necessários
+RUN mkdir -p logs data/models data/embeddings data/unknown_faces
+
+# Comando para executar o recognition worker
+CMD ["conda", "run", "-n", "presence", "--no-capture-output", "python", "app/recognition_worker/main.py"]

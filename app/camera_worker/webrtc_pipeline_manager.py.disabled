@@ -1,0 +1,313 @@
+"""
+Gerenciador do Pipeline WebRTC com GStreamer webrtcbin
+Integra pipeline com servidor de sinalização
+"""
+
+import asyncio
+import json
+from typing import Dict, Optional, List
+from loguru import logger
+from dataclasses import dataclass
+
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from core.webrtc_gstreamer_pipeline import WebRTCGStreamerPipeline, WebRTCPipelineConfig
+from webrtc_worker.webrtc_signaling_server import WebRTCSignalingServer, signaling_server
+
+@dataclass
+class CameraConfig:
+    """Configuração de câmera"""
+    camera_id: str
+    rtsp_url: str
+    name: str = ""
+    enabled: bool = True
+
+class WebRTCPipelineManager:
+    """Gerenciador de múltiplos pipelines WebRTC"""
+    
+    def __init__(self, signaling_server: WebRTCSignalingServer):
+        self.signaling_server = signaling_server
+        self.pipelines: Dict[str, WebRTCGStreamerPipeline] = {}
+        self.pipeline_configs: Dict[str, WebRTCPipelineConfig] = {}
+        self.is_running = False
+        
+        logger.info("WebRTC Pipeline Manager inicializado")
+    
+    async def load_cameras_from_api(self, api_base_url: str = "http://127.0.0.1:17234") -> List[CameraConfig]:
+        """Carregar câmeras da API"""
+        try:
+            import aiohttp
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{api_base_url}/api/v1/cameras") as resp:
+                    if resp.status == 200:
+                        cameras_data = await resp.json()
+                        cameras = []
+                        
+                        for camera_data in cameras_data:
+                            if camera_data.get('enabled', True):
+                                camera = CameraConfig(
+                                    camera_id=camera_data['id'],
+                                    rtsp_url=camera_data['rtsp_url'],
+                                    name=camera_data.get('name', f"Camera {camera_data['id']}"),
+                                    enabled=camera_data.get('enabled', True)
+                                )
+                                cameras.append(camera)
+                        
+                        logger.info(f"📷 {len(cameras)} câmeras carregadas da API")
+                        return cameras
+                    else:
+                        logger.error(f"❌ Erro ao carregar câmeras: {resp.status}")
+                        return []
+                        
+        except Exception as e:
+            logger.error(f"❌ Erro ao conectar com API: {e}")
+            return []
+    
+    def create_pipeline(self, camera_config: CameraConfig) -> bool:
+        """Criar pipeline para câmera"""
+        try:
+            if camera_config.camera_id in self.pipelines:
+                logger.warning(f"⚠️ Pipeline já existe para câmera: {camera_config.camera_id}")
+                return True
+            
+            # Configuração do pipeline
+            pipeline_config = WebRTCPipelineConfig(
+                rtsp_url=camera_config.rtsp_url,
+                camera_id=camera_config.camera_id,
+                output_width=1280,
+                output_height=720,
+                fps=30,
+                use_hardware_decode=True,
+                use_hardware_encode=True,
+                recognition_worker_url="http://127.0.0.1:17235",
+                api_base_url="http://127.0.0.1:17234",
+                enable_recognition=True,
+                stun_server="stun://stun.l.google.com:19302"
+            )
+            
+            # Criar pipeline
+            pipeline = WebRTCGStreamerPipeline(pipeline_config)
+            
+            # Configurar callbacks WebRTC
+            self._setup_pipeline_callbacks(pipeline, camera_config.camera_id)
+            
+            # Armazenar
+            self.pipelines[camera_config.camera_id] = pipeline
+            self.pipeline_configs[camera_config.camera_id] = pipeline_config
+            
+            # Registrar callbacks no servidor de sinalização
+            self._register_signaling_callbacks(camera_config.camera_id)
+            
+            logger.info(f"✅ Pipeline criado para câmera: {camera_config.name} ({camera_config.camera_id})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao criar pipeline para {camera_config.camera_id}: {e}")
+            return False
+    
+    def _setup_pipeline_callbacks(self, pipeline: WebRTCGStreamerPipeline, camera_id: str):
+        """Configurar callbacks do pipeline WebRTC"""
+        
+        def on_offer_created(sdp: str):
+            """Callback quando offer é criado pelo pipeline"""
+            logger.info(f"📤 Pipeline {camera_id} criou offer")
+            
+            # Encontrar sessão ativa para esta câmera
+            for session in self.signaling_server.sessions.values():
+                if session.camera_id == camera_id and session.is_active:
+                    asyncio.create_task(
+                        self.signaling_server.send_offer(session.session_id, sdp)
+                    )
+                    break
+        
+        def on_ice_candidate(mline_index: int, candidate: str):
+            """Callback para ICE candidates do pipeline"""
+            logger.debug(f"🧊 Pipeline {camera_id} gerou ICE candidate")
+            
+            candidate_data = {
+                "candidate": candidate,
+                "sdpMLineIndex": mline_index
+            }
+            
+            # Enviar para todas as sessões ativas desta câmera
+            for session in self.signaling_server.sessions.values():
+                if session.camera_id == camera_id and session.is_active:
+                    asyncio.create_task(
+                        self.signaling_server.send_ice_candidate(session.session_id, candidate_data)
+                    )
+        
+        # Definir callbacks no pipeline
+        pipeline.on_offer_created = on_offer_created
+        pipeline.on_ice_candidate = on_ice_candidate
+    
+    def _register_signaling_callbacks(self, camera_id: str):
+        """Registrar callbacks no servidor de sinalização"""
+        
+        async def on_client_connected(session_id: str):
+            """Callback quando cliente conecta"""
+            logger.info(f"🔌 Cliente conectado para câmera: {camera_id}")
+        
+        async def on_client_disconnected(session_id: str):
+            """Callback quando cliente desconecta"""
+            logger.info(f"🔌 Cliente desconectado da câmera: {camera_id}")
+        
+        async def on_offer_requested(session_id: str):
+            """Callback quando cliente solicita offer"""
+            logger.info(f"🤝 Offer solicitado para câmera: {camera_id}")
+            
+            # Pipeline irá gerar offer automaticamente quando conectar
+            # O webrtcbin emite "on-negotiation-needed" que dispara a criação do offer
+        
+        async def on_answer_received(session_id: str, sdp: str):
+            """Callback quando answer é recebido"""
+            logger.info(f"📥 Answer recebido para câmera: {camera_id}")
+            
+            if camera_id in self.pipelines:
+                pipeline = self.pipelines[camera_id]
+                pipeline.set_remote_description(sdp, "answer")
+        
+        async def on_ice_candidate_received(session_id: str, candidate: Dict):
+            """Callback quando ICE candidate é recebido"""
+            logger.debug(f"🧊 ICE candidate recebido para câmera: {camera_id}")
+            
+            if camera_id in self.pipelines:
+                pipeline = self.pipelines[camera_id]
+                mline_index = candidate.get('sdpMLineIndex', 0)
+                candidate_str = candidate.get('candidate', '')
+                pipeline.add_ice_candidate(mline_index, candidate_str)
+        
+        # Registrar callbacks
+        callbacks = {
+            'on_client_connected': on_client_connected,
+            'on_client_disconnected': on_client_disconnected,
+            'on_offer_requested': on_offer_requested,
+            'on_answer_received': on_answer_received,
+            'on_ice_candidate_received': on_ice_candidate_received
+        }
+        
+        self.signaling_server.register_pipeline_callbacks(camera_id, callbacks)
+    
+    async def start_pipeline(self, camera_id: str) -> bool:
+        """Iniciar pipeline específico"""
+        if camera_id not in self.pipelines:
+            logger.error(f"❌ Pipeline não encontrado: {camera_id}")
+            return False
+        
+        try:
+            pipeline = self.pipelines[camera_id]
+            success = await pipeline.start()
+            
+            if success:
+                logger.info(f"✅ Pipeline iniciado: {camera_id}")
+            else:
+                logger.error(f"❌ Falha ao iniciar pipeline: {camera_id}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao iniciar pipeline {camera_id}: {e}")
+            return False
+    
+    def stop_pipeline(self, camera_id: str):
+        """Parar pipeline específico"""
+        if camera_id in self.pipelines:
+            pipeline = self.pipelines[camera_id]
+            pipeline.stop()
+            
+            # Desregistrar callbacks
+            self.signaling_server.unregister_pipeline_callbacks(camera_id)
+            
+            # Remover das estruturas
+            del self.pipelines[camera_id]
+            del self.pipeline_configs[camera_id]
+            
+            logger.info(f"🛑 Pipeline parado: {camera_id}")
+    
+    async def start_all_pipelines(self):
+        """Iniciar todos os pipelines"""
+        self.is_running = True
+        
+        # Carregar câmeras da API
+        cameras = await self.load_cameras_from_api()
+        
+        if not cameras:
+            logger.warning("⚠️ Nenhuma câmera encontrada na API")
+            return
+        
+        # Criar e iniciar pipelines
+        for camera in cameras:
+            if self.create_pipeline(camera):
+                await self.start_pipeline(camera.camera_id)
+        
+        logger.info(f"🚀 {len(self.pipelines)} pipelines WebRTC iniciados")
+    
+    def stop_all_pipelines(self):
+        """Parar todos os pipelines"""
+        self.is_running = False
+        
+        for camera_id in list(self.pipelines.keys()):
+            self.stop_pipeline(camera_id)
+        
+        logger.info("🛑 Todos os pipelines WebRTC parados")
+    
+    def get_pipeline_stats(self) -> Dict:
+        """Obter estatísticas de todos os pipelines"""
+        stats = {
+            "total_pipelines": len(self.pipelines),
+            "is_running": self.is_running,
+            "pipelines": {}
+        }
+        
+        for camera_id, pipeline in self.pipelines.items():
+            stats["pipelines"][camera_id] = pipeline.get_stats()
+        
+        return stats
+    
+    async def health_check(self) -> Dict:
+        """Verificação de saúde do sistema"""
+        return {
+            "status": "healthy" if self.is_running else "stopped",
+            "pipelines_count": len(self.pipelines),
+            "active_sessions": len(self.signaling_server.sessions),
+            "connected_clients": len(self.signaling_server.connected_clients)
+        }
+
+# Instância global do gerenciador
+pipeline_manager = WebRTCPipelineManager(signaling_server)
+
+async def main():
+    """Função principal para execução standalone"""
+    logger.info("🚀 Iniciando WebRTC Pipeline Manager")
+    
+    try:
+        # Iniciar servidor de sinalização em thread separada
+        signaling_server.start_in_thread()
+        
+        # Aguardar um pouco para o servidor inicializar
+        await asyncio.sleep(2)
+        
+        # Iniciar todos os pipelines
+        await pipeline_manager.start_all_pipelines()
+        
+        # Loop principal
+        while True:
+            await asyncio.sleep(10)
+            
+            # Verificar health dos pipelines
+            stats = pipeline_manager.get_pipeline_stats()
+            logger.info(f"📊 Pipelines ativos: {stats['total_pipelines']}")
+            
+    except KeyboardInterrupt:
+        logger.info("🛑 Interrompido pelo usuário")
+    except Exception as e:
+        logger.error(f"❌ Erro no loop principal: {e}")
+    finally:
+        # Cleanup
+        pipeline_manager.stop_all_pipelines()
+        logger.info("🏁 WebRTC Pipeline Manager finalizado")
+
+if __name__ == "__main__":
+    asyncio.run(main())

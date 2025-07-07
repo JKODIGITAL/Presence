@@ -1,0 +1,26 @@
+# Dockerfile.frontend-base - Contém apenas as dependências do frontend
+FROM node:18-slim AS build-base
+
+# Definir diretório de trabalho
+WORKDIR /app
+
+# Instalar dependências do sistema necessárias
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    make \
+    g++ \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Configurar NPM para otimização
+RUN npm config set fund false && \
+    npm config set audit false && \
+    npm cache clean --force 
+
+# Instalar apenas dependências essenciais globalmente (sem Vite para evitar conflitos)
+RUN npm install -g typescript
+
+# Criar diretório para cache do npm
+RUN mkdir -p /root/.npm && chmod 777 /root/.npm 

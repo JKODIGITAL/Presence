@@ -1,0 +1,85 @@
+# Backend API - Versões estáveis e compatíveis Python 3.10
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==1.10.12
+python-multipart==0.0.6
+jinja2==3.1.2
+
+# Database
+sqlalchemy==2.0.25
+alembic==1.13.1
+
+# Computer Vision & ML - Python 3.10 compatible
+opencv-contrib-python==4.9.0.80
+numpy==1.24.4
+pillow==10.2.0
+scikit-image==0.22.0
+
+# GStreamer - Para câmeras estáveis
+# PyGObject==3.44.1  # Instalado via apt-get no Dockerfile
+
+# ONNX Runtime - Python 3.10 compatible
+onnx==1.15.0
+onnxruntime-gpu==1.17.1
+
+# Face Recognition - Stable version for Python 3.10
+insightface==0.7.3
+
+# NOTE: FAISS-GPU should be installed via conda: conda install pytorch::faiss-gpu
+# For Docker, we'll handle this in the Dockerfile with conda/mamba
+
+# Networking
+aiohttp==3.9.3
+aiohttp-cors==0.7.0
+httpx==0.27.0
+websockets==12.0
+python-socketio[asyncio]==5.11.1
+
+# WebRTC - Real-time streaming
+aiortc==1.6.0
+av==10.0.0
+
+# Async
+aiofiles==23.2.0
+
+# Data Processing
+pandas==2.2.1
+
+# Utilities
+python-dotenv==1.0.1
+pyyaml==6.0.1
+typing-extensions==4.9.0
+json5==0.9.14
+
+# System Tools
+loguru==0.7.2
+psutil==5.9.8
+
+# Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# CLI Tools
+click==8.1.7
+typer==0.9.0
+
+# Video Processing
+imageio==2.34.0
+imageio-ffmpeg==0.4.9
+
+# Development & Testing
+pytest==8.0.2
+pytest-asyncio==0.23.5
+pytest-cov==4.1.0
+black==24.2.0
+flake8==7.0.0
+mypy==1.8.0
+
+# Serialization
+orjson==3.9.15
+msgpack==1.0.8
+
+# Performance
+cython==3.0.8
+matplotlib==3.7.5
+cachetools==5.3.3

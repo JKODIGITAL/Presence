@@ -1,0 +1,99 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Data files
+data/embeddings/*
+data/images/*
+data/videos/*
+data/faces/*
+data/unknown_faces/*
+data/frames/*
+data/db/*
+!data/embeddings/.gitkeep
+!data/images/.gitkeep
+!data/videos/.gitkeep
+
+# Models
+models/*
+data/models/*
+*.onnx
+*.pth
+*.pt
+*.pkl
+*.h5
+*.faiss
+*.index
+!models/.gitkeep
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.h264
+*.h265
+
+# Image files in data
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.png
+data/**/*.bmp
+
+# Temporary files
+*.tmp
+*.temp
+.temp/
+tmp/
+
+# Test files
+test_*.py
+!test_rtsp_connectivity.py
+!test_camera_source.py
+
+# Credentials
+*.secret
+credentials/
+secrets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+
+# Docker
+*.pid
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/src-tauri/target/
+
+# Tauri
+frontend/src-tauri/WixTools/

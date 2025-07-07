@@ -1,0 +1,88 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+pip-log.txt
+pip-delete-this-directory.txt
+.tox
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache
+.pytest_cache
+.hypothesis
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs
+.vscode
+.idea
+*.swp
+*.swo
+
+# Node modules (frontend)
+frontend/node_modules
+frontend/dist
+frontend/build
+
+# Data directories (will be mounted as volumes)
+data/
+logs/
+models/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Documentation
+README.md
+*.md
+docs/
+
+# Tests
+tests/
+test_*.py
+*_test.py
+# Except for required test files for Docker
+!test_docker_connectivity.py
+!validate_container_structure.py
+
+# Git
+.git
+.gitignore
+
+# Docker
+docker-compose.yml
+*.dockerfile
+Dockerfile*
+
+# Environment
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Validation scripts (mas manter alguns para debug)
+validate_people_api.py
+validate_camera_api.py
+validate_camera_monitoring.py
+validate_recognition_system.py
+validate_frontend_integration.py
+validate_docker_setup.py

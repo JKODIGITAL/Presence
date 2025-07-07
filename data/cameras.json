@@ -1,0 +1,38 @@
+{
+  "cameras": [
+    {
+      "id": "camera_01",
+      "name": "Câmera Principal",
+      "url": "rtsp://admin:admin123@192.168.1.100:554/stream1",
+      "fps_limit": 10,
+      "enabled": true,
+      "location": "Entrada Principal",
+      "description": "Câmera de vigilância da entrada principal"
+    },
+    {
+      "id": "camera_02", 
+      "name": "Câmera Secundária",
+      "url": "rtsp://admin:admin123@192.168.1.101:554/stream1",
+      "fps_limit": 8,
+      "enabled": true,
+      "location": "Área de Estacionamento",
+      "description": "Câmera de vigilância do estacionamento"
+    },
+    {
+      "id": "camera_03",
+      "name": "Câmera Interna",
+      "url": "rtsp://admin:admin123@192.168.1.102:554/stream1", 
+      "fps_limit": 15,
+      "enabled": false,
+      "location": "Recepção",
+      "description": "Câmera interna da recepção"
+    }
+  ],
+  "settings": {
+    "default_fps_limit": 10,
+    "connection_timeout": 10,
+    "reconnect_attempts": 3,
+    "health_check_interval": 15,
+    "frame_quality": 85
+  }
+} 

@@ -1,0 +1,1190 @@
+"""
+WebRTC Standalone Worker - Versão independente para MSYS2
+Não depende de módulos do ambiente Conda
+"""
+
+import asyncio
+import time
+import threading
+import os
+import sys
+import json
+import socket
+import base64
+import hashlib
+import logging
+import queue
+from typing import Dict, List, Any, Optional
+from datetime import datetime
+
+# Para processamento de frames
+try:
+    import cv2
+    import numpy as np
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+# Cliente Socket.IO para conectar ao Recognition Worker
+try:
+    import socketio
+    SOCKETIO_AVAILABLE = True
+except ImportError:
+    # Se não tiver socketio, usar implementação simples TCP
+    SOCKETIO_AVAILABLE = False
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(name)s:%(funcName)s:%(lineno)d - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Importar GStreamer (MSYS2)
+try:
+    import gi
+    gi.require_version('Gst', '1.0')
+    gi.require_version('GstApp', '1.0')
+    gi.require_version('GstWebRTC', '1.0')
+    gi.require_version('GstSdp', '1.0')
+    
+    from gi.repository import Gst, GstApp, GLib, GstWebRTC, GstSdp
+    
+    # Inicializar GStreamer
+    Gst.init(None)
+    
+    GSTREAMER_AVAILABLE = True
+    WEBRTC_AVAILABLE = True
+    logger.info("✅ GStreamer WebRTC disponível (MSYS2 nativo)")
+    
+except ImportError as e:
+    logger.error(f"Erro ao importar GStreamer: {e}")
+    GSTREAMER_AVAILABLE = False
+    WEBRTC_AVAILABLE = False
+    sys.exit(1)
+
+# Configurações simples (sem Pydantic)
+class Settings:
+    def __init__(self):
+        self.API_BASE_URL = os.environ.get('API_BASE_URL', 'http://127.0.0.1:17234')
+        self.RECOGNITION_WORKER_URL = os.environ.get('RECOGNITION_WORKER_URL', 'http://127.0.0.1:17235')
+        self.USE_GPU = os.environ.get('USE_GPU', 'true').lower() == 'true'
+        self.ENVIRONMENT = os.environ.get('ENVIRONMENT', 'development')
+
+settings = Settings()
+
+class SimpleWebSocketServer:
+    """WebSocket server simples para sinalização WebRTC"""
+    
+    def __init__(self, host='127.0.0.1', port=8765):
+        self.host = host
+        self.port = port
+        self.server_socket = None
+        self.clients = {}
+        self.running = False
+        self.handlers = {}
+        logger.info(f"WebSocket Server configurado para {host}:{port}")
+    
+    def start(self):
+        """Iniciar servidor WebSocket"""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
+            # Tentar bind na porta
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            self.running = True
+            
+            logger.info(f"🚀 WebSocket server iniciado em {self.host}:{self.port}")
+            
+            # Aceitar conexões em thread separada
+            accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+            accept_thread.start()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao iniciar WebSocket server na porta {self.port}: {e}")
+            return False
+    
+    def _accept_loop(self):
+        """Loop para aceitar conexões"""
+        while self.running:
+            try:
+                self.server_socket.settimeout(1.0)
+                client_socket, address = self.server_socket.accept()
+                client_thread = threading.Thread(
+                    target=self._handle_client,
+                    args=(client_socket, address)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    logger.error(f"Erro ao aceitar conexão: {e}")
+    
+    def _handle_client(self, client_socket, address):
+        """Gerenciar cliente WebSocket"""
+        client_id = f"{address[0]}:{address[1]}"
+        
+        try:
+            # Handshake WebSocket
+            if self._websocket_handshake(client_socket):
+                self.clients[client_id] = client_socket
+                logger.info(f"Cliente WebSocket conectado: {client_id}")
+                
+                # Notificar handler
+                if 'on_connect' in self.handlers:
+                    self.handlers['on_connect'](client_id, client_socket)
+                
+                # Loop de mensagens
+                while self.running:
+                    try:
+                        message = self._receive_message(client_socket)
+                        if message:
+                            if 'on_message' in self.handlers:
+                                self.handlers['on_message'](client_id, message)
+                        else:
+                            break
+                    except Exception:
+                        break
+                
+                # Desconectar
+                if client_id in self.clients:
+                    del self.clients[client_id]
+                    if 'on_disconnect' in self.handlers:
+                        self.handlers['on_disconnect'](client_id)
+                
+                logger.info(f"Cliente WebSocket desconectado: {client_id}")
+        
+        except Exception as e:
+            logger.error(f"Erro no cliente {client_id}: {e}")
+        finally:
+            client_socket.close()
+    
+    def _websocket_handshake(self, client_socket):
+        """Fazer handshake WebSocket"""
+        try:
+            request = client_socket.recv(1024).decode('utf-8')
+            lines = request.split('\r\n')
+            
+            # Verificar se é uma requisição WebSocket válida
+            first_line = lines[0] if lines else ""
+            logger.debug(f"Requisição WebSocket: {first_line}")
+            
+            # Aceitar qualquer path que comece com /ws/ ou / 
+            if not ("GET /" in first_line and "HTTP/1.1" in first_line):
+                logger.warning(f"Requisição inválida: {first_line}")
+                return False
+            
+            # Encontrar headers necessários
+            websocket_key = None
+            upgrade_header = False
+            connection_header = False
+            
+            for line in lines:
+                if line.startswith('Sec-WebSocket-Key:'):
+                    websocket_key = line.split(': ', 1)[1] if ': ' in line else None
+                elif line.lower().startswith('upgrade:'):
+                    upgrade_header = 'websocket' in line.lower()
+                elif line.lower().startswith('connection:'):
+                    connection_header = 'upgrade' in line.lower()
+            
+            if not websocket_key or not upgrade_header or not connection_header:
+                logger.warning(f"Headers WebSocket inválidos - Key: {bool(websocket_key)}, Upgrade: {upgrade_header}, Connection: {connection_header}")
+                return False
+            
+            # Gerar Sec-WebSocket-Accept
+            magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            accept_key = base64.b64encode(
+                hashlib.sha1((websocket_key + magic_string).encode()).digest()
+            ).decode()
+            
+            # Enviar resposta
+            response = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept_key}\r\n"
+                "Sec-WebSocket-Protocol: \r\n\r\n"
+            )
+            client_socket.send(response.encode())
+            logger.info(f"✅ WebSocket handshake concluído com sucesso")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro no handshake WebSocket: {e}")
+            return False
+    
+    def _receive_message(self, client_socket):
+        """Receber mensagem WebSocket"""
+        try:
+            data = client_socket.recv(1024)
+            if len(data) < 2:
+                return None
+            
+            # Parse frame básico
+            payload_length = data[1] & 0x7F
+            if payload_length < 126:
+                mask_start = 2
+            else:
+                return None  # Simplificado
+            
+            if len(data) < mask_start + 4:
+                return None
+                
+            mask = data[mask_start:mask_start + 4]
+            payload_start = mask_start + 4
+            payload_end = payload_start + payload_length
+            
+            if len(data) < payload_end:
+                return None
+                
+            payload = data[payload_start:payload_end]
+            
+            # Unmask
+            decoded = bytearray()
+            for i in range(len(payload)):
+                decoded.append(payload[i] ^ mask[i % 4])
+            
+            return decoded.decode('utf-8')
+            
+        except Exception:
+            return None
+    
+    def send_to_client(self, client_id, message):
+        """Enviar mensagem para cliente específico"""
+        if client_id in self.clients:
+            return self._send_message(self.clients[client_id], message)
+        return False
+    
+    def _send_message(self, client_socket, message):
+        """Enviar mensagem WebSocket"""
+        try:
+            payload = message.encode('utf-8')
+            frame = bytearray()
+            frame.append(0x81)  # Text frame
+            
+            if len(payload) < 126:
+                frame.append(len(payload))
+            else:
+                return False  # Simplificado
+            
+            frame.extend(payload)
+            client_socket.send(frame)
+            return True
+            
+        except Exception:
+            return False
+    
+    def on(self, event, handler):
+        """Registrar handler de evento"""
+        self.handlers[event] = handler
+    
+    def stop(self):
+        """Parar servidor"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        for client in self.clients.values():
+            client.close()
+        self.clients.clear()
+
+class RecognitionClient:
+    """Cliente simples para conectar ao Recognition Worker"""
+    
+    def __init__(self, recognition_url="http://127.0.0.1:17235"):
+        self.recognition_url = recognition_url
+        self.connected = False
+        self.socket = None
+        
+        if SOCKETIO_AVAILABLE:
+            self.socket = socketio.Client()
+            self._setup_handlers()
+    
+    def _setup_handlers(self):
+        """Configurar handlers do Socket.IO"""
+        @self.socket.on('connect')
+        def on_connect():
+            logger.info("✅ Conectado ao Recognition Worker")
+            self.connected = True
+        
+        @self.socket.on('disconnect')
+        def on_disconnect():
+            logger.info("❌ Desconectado do Recognition Worker")
+            self.connected = False
+    
+    async def connect(self):
+        """Conectar ao Recognition Worker"""
+        if SOCKETIO_AVAILABLE and self.socket:
+            try:
+                self.socket.connect(self.recognition_url)
+                return True
+            except Exception as e:
+                logger.error(f"Erro ao conectar ao Recognition Worker: {e}")
+                return False
+        return False
+    
+    async def process_frame(self, frame, camera_id):
+        """Enviar frame para processamento"""
+        if not self.connected or not SOCKETIO_AVAILABLE:
+            return None
+        
+        try:
+            # Comprimir frame
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            frame_base64 = base64.b64encode(buffer).decode('utf-8')
+            
+            # Enviar frame
+            future = asyncio.Future()
+            
+            @self.socket.on('recognition_result')
+            def on_result(data):
+                if data.get('camera_id') == camera_id:
+                    future.set_result(data)
+            
+            self.socket.emit('process_frame', {
+                'camera_id': camera_id,
+                'frame_base64': frame_base64,
+                'timestamp': datetime.now().isoformat(),
+                'frame_id': f"{camera_id}_{int(time.time()*1000)}"
+            })
+            
+            # Aguardar resultado com timeout
+            result = await asyncio.wait_for(future, timeout=2.0)
+            return result
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout ao processar frame da câmera {camera_id}")
+            return None
+        except Exception as e:
+            logger.error(f"Erro ao processar frame: {e}")
+            return None
+    
+    def disconnect(self):
+        """Desconectar do Recognition Worker"""
+        if self.socket and self.connected:
+            self.socket.disconnect()
+
+class WebRTCCamera:
+    """Câmera com WebRTC integrado e reconhecimento facial"""
+    
+    def __init__(self, camera_config: Dict[str, Any]):
+        self.camera_id = camera_config.get('id', 'camera_0')
+        self.camera_name = camera_config.get('name', f'Camera {self.camera_id}')
+        self.rtsp_url = camera_config.get('rtsp_url', '')
+        self.enabled = camera_config.get('enabled', True)
+        self.fps = camera_config.get('fps', 10)
+        self.output_width = camera_config.get('output_width', 640)
+        self.output_height = camera_config.get('output_height', 480)
+        self.use_hardware = settings.USE_GPU
+        
+        # Pipeline GStreamer
+        self.pipeline = None
+        self.webrtc_bin = None
+        self.appsink = None
+        self.appsrc = None
+        self.running = False
+        
+        # WebSocket - usar porta 17236 como base para compatibilidade com frontend
+        camera_index = int(self.camera_id.split('_')[-1] if '_' in self.camera_id else '0')
+        self.websocket_port = 17236 if camera_index == 0 else 17236 + camera_index
+        self.websocket_server = None
+        self.peer_connections = {}
+        
+        # Recognition Worker
+        self.recognition_client = RecognitionClient()
+        self.last_recognition_result = None
+        self.process_every_n_frames = 5  # Processar a cada N frames
+        self.frame_count = 0
+        
+        # Thread para processamento
+        self.processing_thread = None
+        self.frame_queue = queue.Queue(maxsize=2)
+        
+        logger.info(f"WebRTC Camera criada: {self.camera_id} na porta {self.websocket_port}")
+    
+    def draw_futuristic_overlay(self, frame, recognition_result):
+        """Desenhar overlay futurista estilo filme sci-fi"""
+        if not CV2_AVAILABLE or not recognition_result:
+            return frame
+        
+        overlay = frame.copy()
+        h, w = frame.shape[:2]
+        
+        # Cores futuristas (ciano/azul tech)
+        COLOR_PRIMARY = (255, 200, 0)      # Ciano brilhante
+        COLOR_SECONDARY = (255, 150, 0)    # Azul elétrico
+        COLOR_SUCCESS = (0, 255, 100)      # Verde neon
+        COLOR_WARNING = (0, 165, 255)      # Laranja
+        COLOR_TEXT = (255, 255, 255)       # Branco
+        COLOR_SHADOW = (0, 0, 0)           # Preto para sombra
+        
+        # Processar cada face detectada
+        for face in recognition_result.get('faces', []):
+            bbox = face.get('bbox', [])
+            if len(bbox) != 4:
+                continue
+                
+            x1, y1, x2, y2 = bbox
+            person_name = face.get('person_name', 'Desconhecido')
+            confidence = face.get('confidence', 0.0)
+            is_unknown = face.get('is_unknown', True)
+            
+            # Calcular dimensões
+            face_width = x2 - x1
+            face_height = y2 - y1
+            
+            # Cor baseada no status
+            main_color = COLOR_WARNING if is_unknown else COLOR_SUCCESS
+            
+            # 1. Desenhar cantos futuristas (brackets)
+            corner_length = int(min(face_width, face_height) * 0.25)
+            thickness = 2
+            
+            # Canto superior esquerdo
+            cv2.line(overlay, (x1, y1), (x1 + corner_length, y1), main_color, thickness)
+            cv2.line(overlay, (x1, y1), (x1, y1 + corner_length), main_color, thickness)
+            
+            # Canto superior direito
+            cv2.line(overlay, (x2, y1), (x2 - corner_length, y1), main_color, thickness)
+            cv2.line(overlay, (x2, y1), (x2, y1 + corner_length), main_color, thickness)
+            
+            # Canto inferior esquerdo
+            cv2.line(overlay, (x1, y2), (x1 + corner_length, y2), main_color, thickness)
+            cv2.line(overlay, (x1, y2), (x1, y2 - corner_length), main_color, thickness)
+            
+            # Canto inferior direito
+            cv2.line(overlay, (x2, y2), (x2 - corner_length, y2), main_color, thickness)
+            cv2.line(overlay, (x2, y2), (x2, y2 - corner_length), main_color, thickness)
+            
+            # 2. Linhas de scan animadas (opcional - comentado para performance)
+            # scan_y = y1 + int((self.frame_count % 30) * face_height / 30)
+            # cv2.line(overlay, (x1, scan_y), (x2, scan_y), main_color, 1)
+            
+            # 3. Info box futurista
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            font_thickness = 1
+            
+            # Calcular tamanho do texto
+            text_size = cv2.getTextSize(person_name, font, font_scale, font_thickness)[0]
+            conf_text = f"{confidence*100:.1f}%"
+            conf_size = cv2.getTextSize(conf_text, font, font_scale * 0.8, font_thickness)[0]
+            
+            # Box de informações
+            box_height = 35
+            box_width = max(text_size[0], conf_size[0]) + 20
+            box_x = x1
+            box_y = y1 - box_height - 5
+            
+            # Ajustar se sair da tela
+            if box_y < 0:
+                box_y = y2 + 5
+            if box_x + box_width > w:
+                box_x = x2 - box_width
+            
+            # Desenhar background semi-transparente
+            sub_overlay = overlay.copy()
+            cv2.rectangle(sub_overlay, (box_x, box_y), (box_x + box_width, box_y + box_height),
+                         (0, 0, 0), -1)
+            cv2.addWeighted(sub_overlay, 0.7, overlay, 0.3, 0, overlay)
+            
+            # Borda do box
+            cv2.rectangle(overlay, (box_x, box_y), (box_x + box_width, box_y + box_height),
+                         main_color, 1)
+            
+            # Linha decorativa
+            cv2.line(overlay, (box_x + 5, box_y + 20), (box_x + box_width - 5, box_y + 20),
+                    main_color, 1)
+            
+            # Texto com sombra
+            text_x = box_x + 10
+            text_y = box_y + 15
+            
+            # Sombra
+            cv2.putText(overlay, person_name, (text_x + 1, text_y + 1), font, font_scale,
+                       COLOR_SHADOW, font_thickness, cv2.LINE_AA)
+            # Texto principal
+            cv2.putText(overlay, person_name, (text_x, text_y), font, font_scale,
+                       COLOR_TEXT, font_thickness, cv2.LINE_AA)
+            
+            # Confidence
+            cv2.putText(overlay, conf_text, (text_x, text_y + 15), font, font_scale * 0.8,
+                       main_color, font_thickness, cv2.LINE_AA)
+            
+            # 4. Indicador de status (círculo pequeno)
+            status_x = box_x + box_width - 10
+            status_y = box_y + 10
+            cv2.circle(overlay, (status_x, status_y), 3, main_color, -1)
+            cv2.circle(overlay, (status_x, status_y), 5, main_color, 1)
+        
+        # Aplicar overlay com transparência
+        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        
+        return frame
+    
+    def build_pipeline(self) -> str:
+        """
+        Construir pipeline GStreamer COMPLETO com NVDEC → Recognition → Overlay → NVENC → WebRTC
+        
+        Fluxo correto:
+        1. RTSP/Test Source → NVDEC (hardware decode)
+        2. TEE para: Recognition Worker + WebRTC Stream  
+        3. Recognition Worker processa frames → Overlay
+        4. Stream com overlay → NVENC (hardware encode) → WebRTC
+        """
+        
+        # 1. SOURCE: RTSP ou VideoTestSrc
+        if self.rtsp_url:
+            source = f"""
+            rtspsrc location={self.rtsp_url}
+                latency=200
+                drop-on-latency=true
+                retry=3
+                timeout=10
+                udp-reconnect=true
+            ! rtph264depay
+            ! h264parse
+            """
+            
+            # 2. DECODE: NVDEC (hardware) ou fallback software
+            if self.use_hardware:
+                decode = "nvh264dec"
+                logger.info(f"📹 [CAM-{self.camera_id}] Usando NVDEC (hardware decode)")
+            else:
+                decode = "avdec_h264 max-threads=2"
+                logger.info(f"📹 [CAM-{self.camera_id}] Usando avdec_h264 (software decode)")
+        else:
+            # Para teste (videotestsrc)
+            source = "videotestsrc pattern=ball"
+            decode = "videoconvert"
+            logger.info(f"🎬 [CAM-{self.camera_id}] Usando videotestsrc para teste")
+        
+        # 3. ENCODE: NVENC (hardware) ou VP8 (software)
+        if self.use_hardware and self.rtsp_url:  # NVENC apenas para RTSP
+            encode = """
+            nvvideoconvert
+            ! nvh264enc
+                bitrate=2000
+                preset=low-latency-hq
+                gop-size=30
+                rc-mode=cbr
+                zerolatency=true
+            """
+            payloader = "h264parse config-interval=-1 ! rtph264pay config-interval=-1 pt=96"
+            logger.info(f"🎯 [CAM-{self.camera_id}] Usando NVENC (hardware encode)")
+        else:
+            encode = """
+            vp8enc
+                deadline=1
+                cpu-used=16
+                target-bitrate=2000000
+                keyframe-max-dist=30
+            """
+            payloader = "rtpvp8pay pt=96"
+            logger.info(f"🎯 [CAM-{self.camera_id}] Usando vp8enc (WebRTC optimized)")
+        
+        # 4. PIPELINE COMPLETO
+        # TEE divide o stream: um para Recognition, outro para WebRTC
+        pipeline = f"""
+        {source}
+        ! {decode}
+        ! videoconvert
+        ! videoscale method=nearest-neighbour
+        ! video/x-raw,format=BGR,width={self.output_width},height={self.output_height},framerate={self.fps}/1
+        ! tee name=t
+        
+        t. ! queue 
+           ! appsink name=appsink 
+             emit-signals=true 
+             sync=false 
+             max-buffers=2
+             drop=true
+        
+        t. ! queue
+           ! videoconvert
+           ! video/x-raw,format=I420
+           ! {encode}
+           ! {payloader}
+           ! webrtcbin name=webrtcbin bundle-policy=max-bundle
+        """
+        
+        # Remover quebras de linha e espaços extras
+        pipeline_clean = ' '.join(pipeline.split())
+        
+        logger.debug(f"🏗️ [CAM-{self.camera_id}] Pipeline: {pipeline_clean}")
+        return pipeline_clean
+    
+    def _on_frame_captured(self, appsink):
+        """
+        Callback quando um frame é capturado do pipeline para RECOGNITION
+        Este é o ponto onde os frames vão para o Recognition Worker
+        """
+        try:
+            sample = appsink.emit('pull-sample')
+            if sample:
+                buffer = sample.get_buffer()
+                caps = sample.get_caps()
+                
+                # Extrair frame BGR para recognition
+                success, map_info = buffer.map(Gst.MapFlags.READ)
+                if success:
+                    frame_data = np.ndarray(
+                        shape=(self.output_height, self.output_width, 3),
+                        buffer=map_info.data,
+                        dtype=np.uint8
+                    )
+                    buffer.unmap(map_info)
+                    
+                    # IMPORTANTE: Este frame vai para Recognition Worker
+                    try:
+                        self.frame_queue.put_nowait(frame_data.copy())
+                        logger.debug(f"🎯 [CAM-{self.camera_id}] Frame enviado para recognition (queue size: {self.frame_queue.qsize()})")
+                    except queue.Full:
+                        logger.debug(f"⚠️ [CAM-{self.camera_id}] Frame descartado - fila cheia")
+                        
+        except Exception as e:
+            logger.error(f"❌ [CAM-{self.camera_id}] Erro ao capturar frame para recognition: {e}")
+        
+        return Gst.FlowReturn.OK
+    
+    def _processing_thread_worker(self):
+        """
+        Thread worker para processamento COMPLETO: Recognition → Overlay
+        
+        Esta thread é responsável por:
+        1. Pegar frames do appsink (BGR)
+        2. Enviar para Recognition Worker
+        3. Receber resultados de reconhecimento
+        4. Aplicar overlay futurista
+        5. (Futuramente) Injetar frame processado de volta no pipeline
+        """
+        logger.info(f"🧵 [CAM-{self.camera_id}] Thread de processamento iniciada")
+        
+        while self.running:
+            try:
+                # 1. CAPTURAR FRAME da fila
+                frame = self.frame_queue.get(timeout=1.0)
+                
+                # 2. CONTROLAR FPS - processar a cada N frames
+                self.frame_count += 1
+                if self.frame_count % self.process_every_n_frames != 0:
+                    continue
+                
+                logger.debug(f"🎬 [CAM-{self.camera_id}] Processando frame #{self.frame_count}")
+                
+                # 3. ENVIAR PARA RECOGNITION WORKER
+                if self.recognition_client.connected and CV2_AVAILABLE:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    try:
+                        # Enviar frame para Recognition Worker
+                        result = loop.run_until_complete(
+                            self.recognition_client.process_frame(frame, self.camera_id)
+                        )
+                        
+                        if result:
+                            self.last_recognition_result = result
+                            faces_detected = result.get('faces_detected', 0)
+                            recognitions = result.get('recognitions', [])
+                            
+                            if faces_detected > 0:
+                                logger.info(f"👤 [CAM-{self.camera_id}] {faces_detected} faces detectadas, {len(recognitions)} reconhecidas")
+                            
+                    except Exception as e:
+                        logger.debug(f"⚠️ [CAM-{self.camera_id}] Erro no reconhecimento: {e}")
+                    finally:
+                        loop.close()
+                
+                # 4. APLICAR OVERLAY FUTURISTA
+                if self.last_recognition_result and CV2_AVAILABLE:
+                    try:
+                        processed_frame = self.draw_futuristic_overlay(frame, self.last_recognition_result)
+                        logger.debug(f"🎨 [CAM-{self.camera_id}] Overlay aplicado com sucesso")
+                        
+                        # TODO: Injetar frame com overlay de volta no pipeline
+                        # Por enquanto, o overlay está funcionando apenas para logs
+                        # Em uma versão futura, podemos usar appsrc para injetar de volta
+                        
+                    except Exception as e:
+                        logger.error(f"❌ [CAM-{self.camera_id}] Erro ao aplicar overlay: {e}")
+                
+            except queue.Empty:
+                # Normal - não há frames na fila
+                continue
+            except Exception as e:
+                logger.error(f"❌ [CAM-{self.camera_id}] Erro na thread de processamento: {e}")
+                time.sleep(0.1)
+        
+        logger.info(f"🛑 [CAM-{self.camera_id}] Thread de processamento finalizada")
+    
+    async def start(self):
+        """Iniciar câmera e WebSocket"""
+        try:
+            # Conectar ao Recognition Worker
+            await self.recognition_client.connect()
+            
+            # Criar pipeline
+            pipeline_str = self.build_pipeline()
+            logger.info(f"Pipeline: {pipeline_str}")
+            
+            self.pipeline = Gst.parse_launch(pipeline_str)
+            if not self.pipeline:
+                logger.error("Falha ao criar pipeline")
+                return False
+            
+            # Obter elementos
+            self.webrtc_bin = self.pipeline.get_by_name("webrtcbin")
+            self.appsink = self.pipeline.get_by_name("appsink")
+            # Removemos appsrc porque causava erro no pipeline
+            
+            if not self.webrtc_bin:
+                logger.error("❌ [CAM-{self.camera_id}] webrtcbin não encontrado no pipeline")
+                return False
+            
+            logger.info(f"✅ [CAM-{self.camera_id}] Pipeline GStreamer criado com sucesso")
+            
+            # Configurar callbacks do appsink para captura de frames
+            if self.appsink and CV2_AVAILABLE:
+                self.appsink.connect("new-sample", self._on_frame_captured)
+                logger.info("✅ Frame capture configurado")
+            
+            # Configurar callbacks WebRTC
+            self.webrtc_bin.connect("on-ice-candidate", self._on_ice_candidate)
+            self.webrtc_bin.connect("on-negotiation-needed", self._on_negotiation_needed)
+            
+            # Iniciar WebSocket server - usar 0.0.0.0 para aceitar conexões LAN
+            ws_success = False
+            try:
+                self.websocket_server = SimpleWebSocketServer("0.0.0.0", self.websocket_port)
+                self.websocket_server.on('on_connect', self._on_client_connect)
+                self.websocket_server.on('on_message', self._on_client_message)
+                self.websocket_server.on('on_disconnect', self._on_client_disconnect)
+                ws_success = self.websocket_server.start()
+            except Exception as e:
+                logger.error(f"❌ [CAM-{self.camera_id}] Falha no WebSocket 0.0.0.0: {e}")
+                
+            if not ws_success:
+                # Fallback para localhost
+                try:
+                    logger.warning(f"⚠️ [CAM-{self.camera_id}] Tentando fallback para 127.0.0.1")
+                    self.websocket_server = SimpleWebSocketServer("127.0.0.1", self.websocket_port)
+                    self.websocket_server.on('on_connect', self._on_client_connect)
+                    self.websocket_server.on('on_message', self._on_client_message)
+                    self.websocket_server.on('on_disconnect', self._on_client_disconnect)
+                    ws_success = self.websocket_server.start()
+                except Exception as e:
+                    logger.error(f"❌ [CAM-{self.camera_id}] Falha total no WebSocket: {e}")
+                    return False
+            
+            if not ws_success:
+                logger.error(f"❌ [CAM-{self.camera_id}] Não foi possível iniciar WebSocket na porta {self.websocket_port}")
+                return False
+            
+            # Iniciar thread de processamento
+            if CV2_AVAILABLE:
+                self.processing_thread = threading.Thread(target=self._processing_thread_worker, daemon=True)
+                self.processing_thread.start()
+                logger.info("✅ Thread de processamento iniciada")
+            
+            # Iniciar pipeline
+            ret = self.pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                logger.error("Falha ao iniciar pipeline")
+                return False
+            
+            self.running = True
+            logger.info(f"✅ Câmera {self.camera_id} iniciada com WebRTC na porta {self.websocket_port}")
+            
+            if self.recognition_client.connected:
+                logger.info(f"✅ Reconhecimento facial ativo para {self.camera_id}")
+            else:
+                logger.warning(f"⚠️ Reconhecimento facial inativo para {self.camera_id}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro ao iniciar câmera: {e}")
+            return False
+    
+    def _on_client_connect(self, client_id, client_socket):
+        """Cliente WebSocket conectado"""
+        logger.info(f"🎯 [CAM-{self.camera_id}] Cliente WebSocket conectado: {client_id}")
+        self.peer_connections[client_id] = {
+            'created_at': datetime.now(),
+            'socket': client_socket
+        }
+        
+        # Enviar status de boas-vindas
+        welcome_msg = {
+            'type': 'welcome',
+            'camera_id': self.camera_id,
+            'status': 'ready',
+            'timestamp': datetime.now().isoformat()
+        }
+        self.websocket_server.send_to_client(client_id, json.dumps(welcome_msg))
+    
+    def _on_client_message(self, client_id, message):
+        """Mensagem recebida do cliente WebSocket"""
+        try:
+            data = json.loads(message)
+            msg_type = data.get('type')
+            
+            logger.info(f"📨 [CAM-{self.camera_id}] Mensagem de {client_id}: {msg_type}")
+            
+            if msg_type == 'request-offer':
+                logger.info(f"🎬 [CAM-{self.camera_id}] Criando offer para {client_id}")
+                self._create_offer(client_id)
+            elif msg_type == 'answer':
+                logger.info(f"✅ [CAM-{self.camera_id}] Processando answer de {client_id}")
+                self._handle_answer(client_id, data.get('sdp'))
+            elif msg_type == 'ice-candidate':
+                logger.debug(f"🧊 [CAM-{self.camera_id}] ICE candidate de {client_id}")
+                self._handle_ice_candidate(client_id, data.get('candidate'))
+            else:
+                logger.warning(f"⚠️ [CAM-{self.camera_id}] Tipo de mensagem desconhecido: {msg_type}")
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ [CAM-{self.camera_id}] JSON inválido de {client_id}: {e}")
+            logger.error(f"❌ [CAM-{self.camera_id}] Mensagem: {message[:200]}")
+        except Exception as e:
+            logger.error(f"❌ [CAM-{self.camera_id}] Erro ao processar mensagem: {e}")
+    
+    def _on_client_disconnect(self, client_id):
+        """Cliente desconectado"""
+        logger.info(f"Cliente desconectado: {client_id}")
+        if client_id in self.peer_connections:
+            del self.peer_connections[client_id]
+    
+    def _create_offer(self, client_id):
+        """Criar offer WebRTC para cliente"""
+        logger.info(f"🎬 [CAM-{self.camera_id}] Criando WebRTC offer para {client_id}")
+        
+        def on_offer_created(promise, webrtcbin, client_id):
+            try:
+                reply = promise.get_reply()
+                offer = reply.get_value("offer")
+                
+                # Set local description
+                promise2 = Gst.Promise.new()
+                webrtcbin.emit("set-local-description", offer, promise2)
+                
+                # Enviar offer para cliente
+                offer_msg = {
+                    'type': 'offer',
+                    'sdp': offer.sdp.as_text(),
+                    'camera_id': self.camera_id
+                }
+                
+                success = self.websocket_server.send_to_client(client_id, json.dumps(offer_msg))
+                if success:
+                    logger.info(f"✅ [CAM-{self.camera_id}] Offer enviado para {client_id}")
+                else:
+                    logger.error(f"❌ [CAM-{self.camera_id}] Falha ao enviar offer para {client_id}")
+                    
+            except Exception as e:
+                logger.error(f"❌ [CAM-{self.camera_id}] Erro ao criar offer: {e}")
+        
+        try:
+            promise = Gst.Promise.new_with_change_callback(on_offer_created, self.webrtc_bin, client_id)
+            self.webrtc_bin.emit("create-offer", None, promise)
+        except Exception as e:
+            logger.error(f"❌ [CAM-{self.camera_id}] Erro ao solicitar offer: {e}")
+    
+    def _handle_answer(self, client_id, sdp):
+        """Processar answer WebRTC do cliente"""
+        logger.info(f"✅ [CAM-{self.camera_id}] Processando answer de {client_id}")
+        
+        try:
+            # Parse SDP do answer
+            sdp_msg = GstSdp.SDPMessage()
+            GstSdp.sdp_message_parse_buffer(sdp.encode(), sdp_msg)
+            
+            answer = GstWebRTC.WebRTCSessionDescription.new(
+                GstWebRTC.WebRTCSDPType.ANSWER,
+                sdp_msg
+            )
+            
+            # Set remote description
+            promise = Gst.Promise.new()
+            self.webrtc_bin.emit("set-remote-description", answer, promise)
+            
+            logger.info(f"🎯 [CAM-{self.camera_id}] Answer de {client_id} configurado com sucesso")
+            
+        except Exception as e:
+            logger.error(f"❌ [CAM-{self.camera_id}] Erro ao processar answer de {client_id}: {e}")
+    
+    def _handle_ice_candidate(self, client_id, candidate):
+        """Processar ICE candidate"""
+        try:
+            mline_index = candidate.get('sdpMLineIndex', 0)
+            candidate_str = candidate.get('candidate', '')
+            
+            self.webrtc_bin.emit("add-ice-candidate", mline_index, candidate_str)
+            logger.debug(f"ICE candidate adicionado de {client_id}")
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar ICE candidate: {e}")
+    
+    def _on_ice_candidate(self, webrtcbin, mline_index, candidate):
+        """ICE candidate gerado pelo WebRTC"""
+        logger.debug(f"🧊 [CAM-{self.camera_id}] ICE candidate gerado: {candidate[:50]}...")
+        
+        ice_msg = {
+            'type': 'ice-candidate',
+            'candidate': {
+                'candidate': candidate,
+                'sdpMLineIndex': mline_index
+            },
+            'camera_id': self.camera_id
+        }
+        
+        # Enviar para todos os clientes conectados
+        sent_count = 0
+        for client_id in self.peer_connections:
+            if self.websocket_server.send_to_client(client_id, json.dumps(ice_msg)):
+                sent_count += 1
+        
+        logger.debug(f"🧊 [CAM-{self.camera_id}] ICE candidate enviado para {sent_count} clientes")
+    
+    def _on_negotiation_needed(self, webrtcbin):
+        """Negociação necessária"""
+        logger.info("Negociação WebRTC necessária")
+    
+    def stop(self):
+        """Parar câmera"""
+        self.running = False
+        
+        # Parar thread de processamento
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=2.0)
+        
+        # Desconectar recognition client
+        if self.recognition_client:
+            self.recognition_client.disconnect()
+        
+        if self.websocket_server:
+            self.websocket_server.stop()
+        
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+        
+        logger.info(f"Câmera {self.camera_id} parada")
+    
+
+class HealthCheckServer:
+    """Servidor HTTP simples para health checks"""
+    
+    def __init__(self, port=17236):
+        self.port = port
+        self.server = None
+        self.running = False
+    
+    def start(self):
+        """Iniciar servidor HTTP"""
+        import http.server
+        import socketserver
+        
+        class HealthHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/health':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    response = {
+                        'status': 'healthy',
+                        'service': 'webrtc-standalone-worker',
+                        'timestamp': datetime.now().isoformat(),
+                        'webrtc_enabled': True
+                    }
+                    self.wfile.write(json.dumps(response).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            
+            def log_message(self, format, *args):
+                # Suprimir logs HTTP detalhados
+                pass
+        
+        try:
+            self.server = socketserver.TCPServer(("127.0.0.1", self.port), HealthHandler)
+            self.server.allow_reuse_address = True
+            
+            def serve():
+                logger.info(f"✅ Health check HTTP server rodando na porta {self.port}")
+                self.server.serve_forever()
+            
+            server_thread = threading.Thread(target=serve, daemon=True)
+            server_thread.start()
+            
+            self.running = True
+            
+        except Exception as e:
+            logger.error(f"Erro ao iniciar HTTP server na porta {self.port}: {e}")
+    
+    def stop(self):
+        """Parar servidor"""
+        if self.server:
+            self.server.shutdown()
+            self.running = False
+
+class WebRTCWorker:
+    """Worker principal"""
+    
+    def __init__(self):
+        self.cameras = {}
+        self.running = False
+        self.health_servers = []
+    
+    def load_cameras(self) -> List[Dict]:
+        """Carregar configuração de câmeras da API ou usar fallback"""
+        import urllib.request
+        import urllib.error
+        
+        # Primeiro tentar a API
+        try:
+            url = f"{settings.API_BASE_URL}/api/v1/cameras"
+            logger.info(f"🔍 Tentando carregar câmeras da API: {url}")
+            
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode())
+                    cameras = data.get('cameras', [])
+                    logger.info(f"📷 {len(cameras)} câmeras carregadas da API")
+                    
+                    # Converter formato da API
+                    result = []
+                    for cam in cameras:
+                        result.append({
+                            'id': cam.get('id'),
+                            'name': cam.get('name', f"Camera {cam.get('id')}"),
+                            'rtsp_url': cam.get('rtsp_url', ''),
+                            'enabled': cam.get('enabled', True),
+                            'fps': cam.get('fps', 10),
+                            'output_width': cam.get('output_width', 640),
+                            'output_height': cam.get('output_height', 480)
+                        })
+                    
+                    if result:
+                        return result
+                    
+        except urllib.error.URLError as e:
+            logger.warning(f"⚠️ API não disponível: {e}")
+        except Exception as e:
+            logger.warning(f"⚠️ Erro ao carregar câmeras da API: {e}")
+        
+        # Fallback para teste - sempre funcional
+        logger.info("🎬 Usando câmeras de teste (API indisponível)")
+        return [
+            {
+                'id': 'test_camera_0',
+                'name': 'Test Camera 1 (VideoTestSrc)',
+                'rtsp_url': '',  # Usar videotestsrc
+                'enabled': True,
+                'fps': 10,
+                'output_width': 640,
+                'output_height': 480
+            },
+            {
+                'id': 'test_camera_1', 
+                'name': 'Test Camera 2 (VideoTestSrc)',
+                'rtsp_url': '',  # Usar videotestsrc
+                'enabled': True,
+                'fps': 10,
+                'output_width': 640,
+                'output_height': 480
+            }
+        ]
+    
+    async def run(self):
+        """Executar worker"""
+        self.running = True
+        
+        # Iniciar health check servers para portas esperadas pelo frontend
+        health_ports = [17236, 17237, 17238, 17239]  # Suporte para múltiplas câmeras
+        for port in health_ports:
+            try:
+                health_server = HealthCheckServer(port)
+                health_server.start()
+                self.health_servers.append(health_server)
+                logger.info(f"✅ Health check server iniciado na porta {port}")
+            except Exception as e:
+                logger.warning(f"⚠️ Falha ao iniciar health check na porta {port}: {e}")
+        
+        # Carregar câmeras
+        cameras_config = self.load_cameras()
+        
+        # Iniciar câmeras COM WEBRTC
+        for i, config in enumerate(cameras_config):
+            if config.get('enabled'):
+                # Garantir que o ID da câmera tenha o índice correto
+                if '_' not in config['id']:
+                    config['id'] = f"{config['id']}_0"
+                
+                camera = WebRTCCamera(config)
+                if await camera.start():
+                    self.cameras[config['id']] = camera
+                    logger.info(f"📹 Câmera {config['id']} com WebRTC na porta {camera.websocket_port}")
+        
+        logger.info(f"🚀 WebRTC Worker rodando com {len(self.cameras)} câmeras")
+        logger.info("🌐 Cada câmera tem seu próprio WebSocket para WebRTC!")
+        logger.info(f"📡 WebSocket base: 17236 (câmera 0 = 17236, câmera 1 = 17237, etc)")
+        logger.info(f"🏥 Health check endpoints disponíveis em: {health_ports}")
+        logger.info("✅ Compatível com frontend existente!")
+        
+        # Loop principal
+        while self.running:
+            await asyncio.sleep(1)
+    
+    def stop(self):
+        """Parar worker"""
+        self.running = False
+        
+        # Parar health check servers
+        for health_server in self.health_servers:
+            try:
+                health_server.stop()
+                logger.info("Health check server parado")
+            except Exception as e:
+                logger.error(f"Erro ao parar health check server: {e}")
+        
+        # Parar todas as câmeras WebRTC
+        for camera in self.cameras.values():
+            camera.stop()
+        
+        logger.info("WebRTC Worker parado")
+
+async def main():
+    """Função principal"""
+    logger.info("🚀 Iniciando WebRTC Standalone Worker...")
+    
+    worker = WebRTCWorker()
+    
+    try:
+        await worker.run()
+    except KeyboardInterrupt:
+        logger.info("Interrompido pelo usuário")
+    except Exception as e:
+        logger.error(f"Erro fatal: {e}")
+    finally:
+        worker.stop()
+
+if __name__ == "__main__":
+    # Iniciar GLib main loop em thread separada
+    def glib_main():
+        loop = GLib.MainLoop()
+        loop.run()
+    
+    glib_thread = threading.Thread(target=glib_main)
+    glib_thread.daemon = True
+    glib_thread.start()
+    
+    # Executar asyncio
+    asyncio.run(main())

@@ -1,0 +1,18 @@
+# Dockerfile para o Camera Worker do Presence - Usando imagem base com Hot Reload
+FROM presence-worker-base:latest
+
+# Não copiamos o código aqui, pois será montado como volume para Hot Reload
+
+# Instalar watchdog para monitorar alterações nos arquivos
+RUN conda run -n presence pip install --no-cache-dir watchdog
+
+# Script para iniciar o Worker com Hot Reload
+COPY docker/scripts/start_worker_dev.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/start_worker_dev.sh
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD conda run -n presence python -c 'import requests; requests.get("http://presence-api:9000/health")' || exit 1
+
+# Comando para iniciar o Worker com Hot Reload
+CMD ["/usr/local/bin/start_worker_dev.sh"]
